@@ -443,7 +443,7 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
         loop_end = min(r + 142, data.m)
         for v in range(r, loop_end):
             col = v % data.m
-            node_name = DataLoaderS.col[col].replace('-ALL', '').replace('Mentions-', 'Mentions of ').replace(' ALL', '').replace('Solution_', '').replace('_Mentions', '')
+            node_name = data.col[col].replace('-ALL', '').replace('Mentions-', 'Mentions of ').replace(' ALL', '').replace('Solution_', '').replace('_Mentions', '')
             node_name = consistent_name(node_name)
             save_metrics_1d(torch.from_numpy(predict[-1, :, col]), torch.from_numpy(Ytest[-1, :, col]), node_name, 'Validation')
             plot_predicted_actual(predict[-1, :, col], Ytest[-1, :, col], node_name, 'Validation', variance[-1, :, col], confidence_95[-1, :, col])
