@@ -5,11 +5,7 @@ import torch
 import torch.nn as nn
 import sys
 import os
-
-# Add parent directory to path to import from Edit_Code
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'Edit_Code'))
 from net import gtnet
-
 import numpy as np
 import importlib
 import random
@@ -352,13 +348,13 @@ def mc_dropout_forward(model, x, n_samples=20):
 #for testing the model on unseen data, a sliding window can be used when the output period of the model is smaller than the target period to be forecasted.
 #The sliding window uses the output from previous step as input of the next step.
 #In our case, the window was not slided (we predicted 36 months and the model by default predicts 36 months)
-def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_input, is_plot, split_name='Testing'):
+def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_input, is_plot):
     # [개선 3] eval() 모드로 고정 (드롭아웃 비활성화, 성능 최우선)
     model.eval()
     
     # MC Dropout 및 95% CI 설정
     MC_SAMPLES = 20
-    Z_95 = 0.5
+    Z_95 = 1.96
     
     total_loss = 0
     total_loss_l1 = 0
@@ -371,8 +367,6 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
     predictions = []
     sum_squared_diff=0
     sum_absolute_diff=0
-    verbose = (split_name == 'Testing')
-
     r=random.randint(0, 141)
     r=0 # we can choose any random node index for printing
     print('testing r=',str(r))
@@ -382,10 +376,10 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
     x_input = test_window[0:n_input, :].clone() # Generate input sequence
 
     for i in range(n_input, test_window.shape[0], data.out_len):
-        if split_name == 'Testing':
-            print('**************x_input*******************')
-            print(x_input[:,r])#prints 1 random column in the sliding window
-            print('**************-------*******************')
+
+        print('**************x_input*******************')
+        print(x_input[:,r])#prints 1 random column in the sliding window
+        print('**************-------*******************')
 
         X = torch.unsqueeze(x_input,dim=0)
         X = torch.unsqueeze(X,dim=1)
@@ -471,7 +465,7 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
     ci_series = None
     if is_plot and (std_series is not None):
         std_series = std_series * scale_2d
-        Z_95 = 0.5
+        Z_95 = 1.96
         ci_series = Z_95 * std_series
         print("CI min/max:", ci_series.min().item(), ci_series.max().item())
 
@@ -549,9 +543,7 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
     Ytest = _to_numpy(test)
 
     counter = 0
-    if split_name == 'Validation':
-        pass
-    if is_plot and split_name == 'Testing':
+    if is_plot:
         print("\n[Plotting] Saving graphs to Testing folder...")
         
         from pathlib import Path
@@ -1082,25 +1074,6 @@ def main(experiment, seed=None):
 
         Data = DataLoaderS(args.data, 0.6, 0.2, device, args.horizon, args.seq_in_len, normalize=args.normalize, out=args.seq_out_len)
 
-        if hasattr(Data, 'col'):
-            # args.fx_keyword (기본값 'fx')를 이용해 인덱스 찾기
-            target_fx_indices = _get_fx_indices(Data.col, getattr(args, 'fx_keyword', 'fx'))
-            Data.fx_idx = target_fx_indices
-            print(f"[INFO] FX Weighting Enabled: Found {len(Data.fx_idx)} FX nodes for training loss weight.")
-        else:
-            Data.fx_idx = []
-            print("[INFO] No columns found in Data, FX weighting disabled.")
-
-        train_ratio = 0.6
-        valid_ratio = 0.2
-        total_len = Data.rawdat.shape[0]
-
-        val_start_idx = int(total_len * train_ratio) - args.seq_in_len # 초기 입력을 위해 뒤로 이동
-        val_end_idx = int(total_len * (train_ratio + valid_ratio))
-
-        # valid_window 생성 (Tensor)
-        Data.valid_window = Data.rawdat[val_start_idx:val_end_idx, :].clone()
-
         # [4순위 안정화] epochs=0 대기 - 데이터 체크전용
         if args.epochs == 0:
             print("[INFO] epochs=0: data/model check only. Exiting.")
@@ -1210,20 +1183,11 @@ def main(experiment, seed=None):
 
                 epoch_start_time = time.time()
                 train_loss = train(Data, Data.train[0], Data.train[1], model, criterion, optim, args.batch_size)
-                val_rse, val_rae, val_corr, val_smape, _, _ = evaluate_sliding_window(
-                    Data, 
-                    Data.valid_window, 
-                    model, 
-                    evaluateL2, 
-                    evaluateL1,
-                    args.seq_in_len,
-                    is_plot=False,
-                    split_name='Validation'
-                )
-
+                val_loss, val_rae, val_corr, val_smape = evaluate(Data, Data.valid[0], Data.valid[1], model, evaluateL2, evaluateL1,
+                                                 args.batch_size,False)
                 print(
                     '| end of epoch {:3d} | time: {:5.2f}s | train_loss {:5.4f} | valid rse {:5.4f} | valid rae {:5.4f} | valid corr  {:5.4f} | valid smape  {:5.4f}'.format(
-                        epoch, (time.time() - epoch_start_time), train_loss, val_rse, val_rae, val_corr, val_smape), flush=True)
+                        epoch, (time.time() - epoch_start_time), train_loss, val_loss, val_rae, val_corr, val_smape), flush=True)
                 
                 # [4순위 추가] 매 epoch마다 lr 감소 (학습률 스케줄)
                 # optim.lr_step()
@@ -1231,12 +1195,12 @@ def main(experiment, seed=None):
                 print(f"  → current lr: {current_lr:.6f}", flush=True)
                 
                 # Save the model if the validation loss is the best we've seen so far.
-                sum_loss = val_rse+val_rae-val_corr
-                if (not math.isnan(val_corr)) and val_rse < best_rse:
+                sum_loss=val_loss+val_rae-val_corr
+                if (not math.isnan(val_corr)) and val_loss < best_rse:
                     with open(save_path_run, 'wb') as f:
                         torch.save(model, f)
                     best_val = sum_loss
-                    best_rse= val_rse
+                    best_rse= val_loss
                     best_rae= val_rae
                     best_corr= val_corr
                     best_smape=val_smape
@@ -1247,7 +1211,7 @@ def main(experiment, seed=None):
                     
                     test_acc, test_rae, test_corr, test_smape, _, _ = evaluate_sliding_window(Data, Data.test_window, model, evaluateL2, evaluateL1,
                                            args.seq_in_len, False) 
-                    scheduler.step(val_rse)
+                    scheduler.step(val_loss)
                     print('********************************************************************************************************')
                     print("test rse {:5.4f} | test rae {:5.4f} | test corr {:5.4f}| test smape {:5.4f}".format(test_acc, test_rae, test_corr, test_smape), flush=True)
                     print('********************************************************************************************************')
@@ -1270,10 +1234,7 @@ def main(experiment, seed=None):
     
     # Load the best saved model.
     with open(save_path_run, 'rb') as f:
-        try:
-            model = torch.load(f, weights_only=False)
-        except TypeError:
-            model = torch.load(f)
+        model = torch.load(f, weights_only=False)
 
     vtest_acc, vtest_rae, vtest_corr, vtest_smape = evaluate(Data, Data.valid[0], Data.valid[1], model, evaluateL2, evaluateL1,
                                          args.batch_size, True)
