@@ -312,6 +312,22 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
     smape /= Ytest.shape[1]
 
     # counter = 0
+    from pathlib import Path
+    import os
+    
+    # 경로 설정 (train_test.py 위치 기준)
+    PROJECT_DIR = Path(__file__).resolve().parents[1]
+    save_path = PROJECT_DIR / 'AXIS' / 'model' / 'Bayesian' / 'Testing'
+    save_path.mkdir(parents=True, exist_ok=True)
+    
+    avg_file = save_path / 'Average_of_each_call.txt'
+    
+    # 파일 저장 (전체 평균값 기록)
+    with open(avg_file, 'w', encoding='utf-8') as f:
+        f.write(f"rse: {rrse:.6f}\n")
+        f.write(f"rae: {rae:.6f}\n")
+        f.write(f"correlation: {correlation:.6f}\n")
+        f.write(f"smape: {smape:.6f}\n")
 
     if is_plot:
         loop_end = min(r + 142, data.m) 
@@ -499,7 +515,8 @@ DEFAULT_DATA_PATH = AXIS_DIR / 'ExchangeRate_dataset.csv'
 DEFAULT_MODEL_SAVE = MODEL_BASE_DIR / 'model.pt'
 
 parser = argparse.ArgumentParser(description='PyTorch Time series forecasting')
-parser.add_argument('--data', type=str, default=str(DEFAULT_DATA_PATH),
+parser.add_argument('--data', type=str, 
+                    default='/content/drive/MyDrive/Cyber-trend-forecasting-main/Cyber-trend-forecasting-main/B-MTGNN/data/ExchangeRate_dataset.csv',
                     help='location of the data file')
 parser.add_argument('--log_interval', type=int, default=2000, metavar='N',
                     help='report interval')
@@ -587,7 +604,7 @@ def main(experiment):
 
     best_hp = []
 
-    for q in range(60):
+    for q in range(1):
         gcn_depth = gcn_depths[randrange(len(gcn_depths))]
         lr = lrs[randrange(len(lrs))]
         conv = convs[randrange(len(convs))]
