@@ -1,4 +1,5 @@
 import argparse
+import os
 import math
 import time
 import torch
@@ -18,7 +19,10 @@ from pathlib import Path
 
 plt.rcParams['savefig.dpi'] = 1200
 
-PROJECT_DIR = Path(__file__).resolve().parents[1]
+try:
+    PROJECT_DIR = Path(__file__).resolve().parents[1]
+except NameError:
+    PROJECT_DIR = Path(os.getcwd())
 AXIS_DIR = PROJECT_DIR / 'AXIS'
 MODEL_BASE_DIR = AXIS_DIR / 'model' / 'Bayesian'
 
@@ -117,29 +121,24 @@ def save_metrics_1d(predict, test, title, type):
 
 
 def plot_predicted_actual(predicted, actual, title, type, variance, confidence_95):
-    months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-    M = []
-    for year in range(11, 23):
-        for month in months:
-            if year == 11 and month not in ['Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']:
-                continue
-            M.append(month + '-' + str(year))
-    M2 = []
-    p = []
-    
-    if type == 'Testing':
-        M = M[-len(predicted):]
-        for index, value in enumerate(M):
-            if 'Dec' in M[index] or 'Mar' in M[index] or 'Jun' in M[index] or 'Sep' in M[index]:
-                M2.append(M[index])
-                p.append(index + 1)
-    
-    else:
-        M = M[63:99]
-        for index, value in enumerate(M):
-            if 'Dec' in M[index] or 'Mar' in M[index] or 'Jun' in M[index] or 'Sep' in M[index]:
-                M2.append(M[index])
-                p.append(index + 1)
+    # === X축 날짜 매핑: Testing/Validation = Aug/22 ~ Jul/25 (값/학습은 그대로, 라벨만) ===
+    import pandas as pd
+    END = pd.Timestamp("2025-07-01")  # 최종 관측: 25/Jul
+    dates = pd.date_range(end=END, periods=len(predicted), freq="MS")
+    labels_all = [d.strftime('%b-%y') for d in dates]
+
+    # === 완전 균등 간격 + 시작(Aug) / 끝(Jul) 반드시 포함 ===
+    # Aug-22(0) ~ Jul-25(35) => (len-1)=35를 나누는 step만 균등 가능
+    step = 5   # 추천: 라벨 과밀 방지 + 완전 균등
+    total = len(labels_all) - 1
+    if total % step != 0:
+        step = 1  # 안전장치(데이터 길이가 바뀌면 월별로라도 균등)
+    idxs = list(range(0, len(labels_all), step))  # total%step==0이면 자동으로 마지막 포함
+    if idxs[-1] != total:
+        idxs.append(total)
+
+    M2 = [labels_all[i] for i in idxs]
+    p = [i + 1 for i in idxs]  # x가 1부터 시작
 
     x = range(1, len(predicted) + 1)
     plt.plot(x, actual, 'b-', label='Actual')
@@ -154,13 +153,13 @@ def plot_predicted_actual(predicted, actual, title, type, variance, confidence_9
     locs, labs = plt.xticks()
     plt.xticks(ticks=p, labels=M2, rotation='vertical', fontsize=13)
     plt.yticks(fontsize=13)
-    
+
     fig = plt.gcf()
     title = title.replace('/', '_')
-    
+
     save_dir = MODEL_BASE_DIR / type
     save_dir.mkdir(parents=True, exist_ok=True)
-    
+
     plt.savefig(save_dir / f"{title}_{type}.png", bbox_inches="tight")
     # plt.savefig(save_dir / f"{title}_{type}.pdf", bbox_inches="tight", format='pdf')
 
@@ -169,12 +168,44 @@ def plot_predicted_actual(predicted, actual, title, type, variance, confidence_9
     plt.close()
 
 
-def s_mape(yTrue, yPred):
-    mape = 0
-    for i in range(len(yTrue)):
-        mape += abs(yTrue[i] - yPred[i]) / (abs(yTrue[i]) + abs(yPred[i]))
-    mape /= len(yTrue)
-    return mape
+def s_mape(yTrue, yPred, eps=1e-8):
+    """Symmetric MAPE.
+
+    eps를 더해 0/0 상황에서 NaN이 나오는 것을 방지한다.
+    """
+    mape = 0.0
+    n = len(yTrue)
+    if n == 0:
+        return float('nan')
+    for i in range(n):
+        denom = abs(yTrue[i]) + abs(yPred[i]) + eps
+        mape += abs(yTrue[i] - yPred[i]) / denom
+    mape /= n
+    return float(mape)
+
+
+def _select_metric_nodes(data, fallback_m):
+    """메트릭 계산에 사용할 노드 인덱스 선택.
+
+    - 우선순위 1) 'fx' 포함 & 'us_fx' 제외
+    - 우선순위 2) 'fx' 포함
+    - 우선순위 3) 전체 노드
+    """
+    col_names = getattr(data, 'col', None)
+    if col_names is None:
+        return list(range(fallback_m))
+
+    # pandas Index/리스트/튜플 등 대응
+    names = [str(x) for x in list(col_names)]
+    fx_wo_us = [i for i, n in enumerate(names) if ('fx' in n.lower()) and ('us_fx' not in n.lower())]
+    if len(fx_wo_us) > 0:
+        return fx_wo_us
+
+    fx_all = [i for i, n in enumerate(names) if ('fx' in n.lower())]
+    if len(fx_all) > 0:
+        return fx_all
+
+    return list(range(min(len(names), fallback_m)))
 
 # ========================================================
 # [수정] horizon 파라미터 추가, y_true 인덱싱 시 horizon 반영
@@ -274,42 +305,40 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
     variance *= scale
     confidence_95 *= scale
 
-    sum_squared_diff = torch.sum(torch.pow(test - predict, 2))
-    sum_absolute_diff = torch.sum(torch.abs(test - predict))
+    # === metrics: per-node(RRSE/RAE) 평균 (txt 파일과 동일한 기준) ===
+    idx = _select_metric_nodes(data, data.m)
 
-    root_sum_squared = math.sqrt(sum_squared_diff)
-    test_s = test
-    mean_all = torch.mean(test_s, dim=0)
-    diff_r = test_s - mean_all.expand(test_s.size(0), data.m)
-    sum_squared_r = torch.sum(torch.pow(diff_r, 2))
-    root_sum_squared_r = math.sqrt(sum_squared_r)
+    rrse_list = []
+    rae_list = []
+    for i in idx:
+        yt = test[:, i].contiguous().view(-1)
+        yp = predict[:, i].contiguous().view(-1)
+        diff = yt - yp
+        rrse_num = torch.sqrt(torch.sum(diff ** 2))
+        rrse_den = torch.sqrt(torch.sum((yt - yt.mean()) ** 2))
+        rrse_list.append((rrse_num / (rrse_den + 1e-12)).item())
 
-    if root_sum_squared_r == 0:
-        rrse = 0.0
-    else:
-        rrse = root_sum_squared / root_sum_squared_r
-    
-    print('rrse=', root_sum_squared, '/', root_sum_squared_r)
+        rae_num = torch.sum(torch.abs(diff))
+        rae_den = torch.sum(torch.abs(yt - yt.mean()))
+        rae_list.append((rae_num / (rae_den + 1e-12)).item())
 
-    sum_absolute_r = torch.sum(torch.abs(diff_r))
-    rae = sum_absolute_diff / sum_absolute_r
-    rae = rae.item()
+    rrse = float(np.mean(rrse_list))
+    rae = float(np.mean(rae_list))
 
+    # correlation/smape도 동일한 노드 집합으로 계산
     predict = predict.data.cpu().numpy()
     Ytest = test.data.cpu().numpy()
-    sigma_p = (predict).std(axis=0)
-    sigma_g = (Ytest).std(axis=0)
-    mean_p = predict.mean(axis=0)
-    mean_g = Ytest.mean(axis=0)
-    index = (sigma_g != 0)
-    correlation = ((predict - mean_p) * (Ytest - mean_g)).mean(axis=0) / (sigma_p * sigma_g)
-    correlation = (correlation[index]).mean()
 
-    smape = 0
-    # Ytest shape이 (Time, Node)인지 확인 후 루프
-    for z in range(Ytest.shape[1]):
-        smape += s_mape(Ytest[:, z], predict[:, z])
-    smape /= Ytest.shape[1]
+    corr_list = []
+    for i in idx:
+        yp = predict[:, i].reshape(-1)
+        yt = Ytest[:, i].reshape(-1)
+        if np.std(yp) > 1e-12 and np.std(yt) > 1e-12:
+            corr_list.append(float(np.corrcoef(yp, yt)[0, 1]))
+    correlation = float(np.mean(corr_list)) if len(corr_list) else float('nan')
+
+    smape_list = [float(s_mape(Ytest[:, i], predict[:, i])) for i in idx]
+    smape = float(np.mean(smape_list)) if len(smape_list) else float('nan')
 
     # counter = 0
     from pathlib import Path
@@ -350,6 +379,9 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
 
 
 def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
+    # Ensure model is in eval mode during validation (dropout/BN fixed)
+    model.eval()
+
     total_loss = 0
     total_loss_l1 = 0
     n_samples = 0
@@ -362,9 +394,10 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
     r = 0
     print('validation r=', str(r))
 
-    for X, Y in data.get_batches(X, Y, batch_size, False):
-        X = torch.unsqueeze(X, dim=1)
-        X = X.transpose(2, 3)
+    with torch.no_grad():
+        for X, Y in data.get_batches(X, Y, batch_size, False):
+            X = torch.unsqueeze(X, dim=1)
+            X = X.transpose(2, 3)
 
         num_runs = 10
         outputs = []
@@ -418,40 +451,54 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
         sum_squared_diff += torch.sum(torch.pow(Y - output, 2))
         sum_absolute_diff += torch.sum(torch.abs(Y - output))
 
-    rse = math.sqrt(total_loss / n_samples) / data.rse 
-    rae = (total_loss_l1 / n_samples) / data.rae 
+    # --------------------------
+    # Metric 산출 기준 통일
+    # - 개별 노드 txt(save_metrics_1d)와 동일하게: "노드별 RSE/RAE"를 구한 뒤 평균
+    # - 가능하면 FX 노드만(US FX는 있으면 제외)로 평가
+    # --------------------------
+    idx = _select_metric_nodes(data, data.m)
+    eps = 1e-12
 
-    root_sum_squared = math.sqrt(sum_squared_diff)
-    test_s = test
-    mean_all = torch.mean(test_s, dim=(0, 1))
-    diff_r = test_s - mean_all.expand(test_s.size(0), test_s.size(1), data.m)
-    sum_squared_r = torch.sum(torch.pow(diff_r, 2))
-    root_sum_squared_r = math.sqrt(sum_squared_r)
+    rrse_list = []
+    rae_list = []
+    for i in idx:
+        yt = test[:, :, i].contiguous().view(-1)
+        yp = predict[:, :, i].contiguous().view(-1)
+        diff = yt - yp
 
-    if root_sum_squared_r == 0:
-        rrse = 0.0
-    else:
-        rrse = root_sum_squared / root_sum_squared_r
+        rrse_num = torch.sqrt(torch.sum(diff ** 2))
+        rrse_den = torch.sqrt(torch.sum((yt - yt.mean()) ** 2))
+        rrse_i = (rrse_num / (rrse_den + eps)).item()
 
-    sum_absolute_r = torch.sum(torch.abs(diff_r))
-    rae = sum_absolute_diff / sum_absolute_r
-    rae = rae.item()
+        rae_num = torch.sum(torch.abs(diff))
+        rae_den = torch.sum(torch.abs(yt - yt.mean()))
+        rae_i = (rae_num / (rae_den + eps)).item()
 
+        rrse_list.append(rrse_i)
+        rae_list.append(rae_i)
+
+    rrse = float(np.mean(rrse_list)) if len(rrse_list) else float('nan')
+    rae = float(np.mean(rae_list)) if len(rae_list) else float('nan')
+
+    # correlation / smape (같은 idx 기준)
     predict = predict.data.cpu().numpy()
     Ytest = test.data.cpu().numpy()
-    sigma_p = (predict).std(axis=0)
-    sigma_g = (Ytest).std(axis=0)
-    mean_p = predict.mean(axis=0)
-    mean_g = Ytest.mean(axis=0)
-    index = (sigma_g != 0)
-    correlation = ((predict - mean_p) * (Ytest - mean_g)).mean(axis=0) / (sigma_p * sigma_g)
-    correlation = (correlation[index]).mean()
 
-    smape = 0
+    corr_list = []
+    for i in idx:
+        yp = predict[:, :, i].reshape(-1)
+        yt = Ytest[:, :, i].reshape(-1)
+        if np.std(yp) > eps and np.std(yt) > eps:
+            corr_list.append(float(np.corrcoef(yp, yt)[0, 1]))
+    correlation = float(np.mean(corr_list)) if len(corr_list) else float('nan')
+
+    smape_sum = 0.0
+    smape_cnt = 0
     for x in range(Ytest.shape[0]):
-        for z in range(Ytest.shape[2]):
-            smape += s_mape(Ytest[x, :, z], predict[x, :, z])
-    smape /= Ytest.shape[0] * Ytest.shape[2]
+        for z in idx:
+            smape_sum += s_mape(Ytest[x, :, z], predict[x, :, z])
+            smape_cnt += 1
+    smape = (smape_sum / smape_cnt) if smape_cnt else float('nan')
 
     counter = 0
     if is_plot:
@@ -464,6 +511,8 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
             save_metrics_1d(torch.from_numpy(predict[-1, :, col]), torch.from_numpy(Ytest[-1, :, col]), node_name, 'Validation')
             plot_predicted_actual(predict[-1, :, col], Ytest[-1, :, col], node_name, 'Validation', variance[-1, :, col], confidence_95[-1, :, col])
             counter += 1
+    # restore train mode
+    model.train()
     return rrse, rae, correlation, smape
 
 
@@ -516,8 +565,8 @@ DEFAULT_MODEL_SAVE = MODEL_BASE_DIR / 'model.pt'
 
 parser = argparse.ArgumentParser(description='PyTorch Time series forecasting')
 parser.add_argument('--data', type=str, 
-                    default='/content/drive/MyDrive/Cyber-trend-forecasting-main/Cyber-trend-forecasting-main/B-MTGNN/data/ExchangeRate_dataset.csv',
-                    help='location of the data file')
+    default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'ExchangeRate_dataset.csv'),
+    help='location of the data file')
 parser.add_argument('--log_interval', type=int, default=2000, metavar='N',
                     help='report interval')
 parser.add_argument('--save', type=str, default=str(DEFAULT_MODEL_SAVE),
@@ -552,6 +601,7 @@ parser.add_argument('--batch_size', type=int, default=8, help='batch size')
 parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
 parser.add_argument('--weight_decay', type=float, default=0.00001, help='weight decay rate')
 parser.add_argument('--clip', type=int, default=10, help='clip')
+parser.add_argument('--lr_decay', type=float, default=1.0, help='learning rate decay (gamma for ExponentialLR)')
 parser.add_argument('--propalpha', type=float, default=0.05, help='prop alpha')
 parser.add_argument('--tanhalpha', type=float, default=3, help='tanh alpha')
 parser.add_argument('--epochs', type=int, default=100, help='')
@@ -562,6 +612,19 @@ parser.add_argument('--step_size', type=int, default=100, help='step_size')
 args = parser.parse_args()
 device = torch.device('cpu')
 torch.set_num_threads(3)
+
+# ---- 데이터 경로 자동 보정 (어느 디렉토리에서 실행해도 동작) ----
+from pathlib import Path
+_here = Path(__file__).resolve().parent
+_p = Path(args.data)
+if (not _p.is_absolute()) and (not _p.exists()):
+    cand = _here / args.data
+    if cand.exists():
+        args.data = str(cand)
+    else:
+        cand2 = _here / 'data' / _p.name
+        if cand2.exists():
+            args.data = str(cand2)
 
 
 def set_random_seed(seed):
@@ -577,12 +640,13 @@ fixed_seed = 123
 
 
 def main(experiment):
+
     set_random_seed(fixed_seed)
 
     gcn_depths = [1, 2, 3]
     lrs = [0.01, 0.001, 0.0005, 0.0008, 0.0001, 0.0003, 0.005]
-    convs = [4, 8, 16]
-    ress = [16, 32, 64]
+    convs = [4, 8]
+    ress = [8, 16]
     skips = [64, 128, 256]
     ends = [256, 512, 1024]
     layers = [1, 2]
@@ -604,7 +668,7 @@ def main(experiment):
 
     best_hp = []
 
-    for q in range(1):
+    for q in range(80):
         gcn_depth = gcn_depths[randrange(len(gcn_depths))]
         lr = lrs[randrange(len(lrs))]
         conv = convs[randrange(len(convs))]
@@ -658,15 +722,14 @@ def main(experiment):
         nParams = sum([p.nelement() for p in model.parameters()])
         print('Number of model parameters is', nParams, flush=True)
 
-        if args.L1Loss:
-            criterion = nn.L1Loss(reduction='sum').to(device)
-        else:
-            criterion = nn.MSELoss(reduction='sum').to(device)
-        evaluateL2 = nn.MSELoss(reduction='sum').to(device)
-        evaluateL1 = nn.L1Loss(reduction='sum').to(device)
+        criterion = nn.SmoothL1Loss(reduction='mean').to(device)
+
+       # 평가지표용(L1, L2)은 그대로 두셔도 됩니다
+        evaluateL2 = nn.MSELoss(reduction='mean').to(device)
+        evaluateL1 = nn.L1Loss(reduction='mean').to(device)
 
         optim = Optim(
-            model.parameters(), args.optim, lr, args.clip, lr_decay=args.weight_decay
+            model.parameters(), args.optim, lr, args.clip, lr_decay=args.lr_decay, weight_decay=args.weight_decay
         )
 
         es_counter = 0
