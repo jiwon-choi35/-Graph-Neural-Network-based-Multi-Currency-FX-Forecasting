@@ -5,9 +5,9 @@ import time
 import random
 
 # Ensure scripts directory is in path for module imports
-script_dir = os.path.dirname(os.path.abspath(__file__))
-if script_dir not in sys.path:
-    sys.path.insert(0, script_dir)
+current_dir = os.getcwd()
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
 
 from layer import *
 from util import DataLoaderS
@@ -169,6 +169,11 @@ class gtnet(nn.Module):
         x = F.relu(skip)
         x = F.relu(self.end_conv_1(x))
         x = self.end_conv_2(x)
+
+        # === persistence(마지막 입력값) residual 추가 ===
+        # input: [B, 1, N, L], x: [B, H, N, 1]
+        base = input[:, :, :, -1:].repeat(1, x.size(1), 1, 1)
+        x = x + base
 
         return x
     
