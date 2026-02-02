@@ -7,13 +7,14 @@ import torch.nn as nn
 import sys
 import os
 
-# Ensure scripts directory is in path for module imports
-script_dir = os.path.dirname(os.path.abspath(__file__))
-if script_dir not in sys.path:
-    sys.path.insert(0, script_dir)
+if 'google.colab' in str(get_ipython()):
+    # 현재 경로를 sys.path에 추가
+    current_path = os.getcwd()
+    if current_path not in sys.path:
+        sys.path.append(current_path)
 
 from net import gtnet
-from o_util import *
+from util import *
 from trainer import Optim
 from random import randrange
 from matplotlib import pyplot as plt
@@ -70,46 +71,50 @@ def train(data, X, Y, model, criterion, optim, batch_size):
     return total_loss / n_samples
 
 
+DEFAULT_DATA_PATH = AXIS_DIR / 'ExchangeRate_DATA.csv'
+DEFAULT_MODEL_SAVE = MODEL_BASE_DIR / 'model.pt'
+
 parser = argparse.ArgumentParser(description='PyTorch Time series forecasting')
-parser.add_argument('--data', type=str, default='./data/sm_data.txt',
-                    help='location of the data file')
-parser.add_argument('--log_interval', type=int, default=2000, metavar='N',
-                    help='report interval')
-parser.add_argument('--save', type=str, default='model/Bayesian/o_model.pt',
-                    help='path to save the final model')
+parser.add_argument('--data', type=str, default=str(DEFAULT_DATA_PATH), help='location of the data file')
+parser.add_argument('--log_interval', type=int, default=2000, metavar='N', help='report interval')
+parser.add_argument('--save', type=str, default=str(DEFAULT_MODEL_SAVE), help='path to save the final model')
 parser.add_argument('--optim', type=str, default='adam')
-parser.add_argument('--L1Loss', type=bool, default=True)
+parser.add_argument('--L1Loss', type=bool, default=False)
 parser.add_argument('--normalize', type=int, default=2)
-parser.add_argument('--device',type=str,default='cuda:1',help='')
+parser.add_argument('--device', type=str, default='cuda:1', help='')
 parser.add_argument('--gcn_true', type=bool, default=True, help='whether to add graph convolution layer')
 parser.add_argument('--buildA_true', type=bool, default=True, help='whether to construct adaptive adjacency matrix')
-parser.add_argument('--gcn_depth',type=int,default=2,help='graph convolution depth')
-parser.add_argument('--num_nodes',type=int,default=142,help='number of nodes/variables')
-parser.add_argument('--dropout',type=float,default=0.3,help='dropout rate')
-parser.add_argument('--subgraph_size',type=int,default=20,help='k')
-parser.add_argument('--node_dim',type=int,default=40,help='dim of nodes')
-parser.add_argument('--dilation_exponential',type=int,default=2,help='dilation exponential')
-parser.add_argument('--conv_channels',type=int,default=16,help='convolution channels')
-parser.add_argument('--residual_channels',type=int,default=16,help='residual channels')
-parser.add_argument('--skip_channels',type=int,default=32,help='skip channels')
-parser.add_argument('--end_channels',type=int,default=64,help='end channels')
-parser.add_argument('--in_dim',type=int,default=1,help='inputs dimension')
-parser.add_argument('--seq_in_len',type=int,default=10,help='input sequence length')
-parser.add_argument('--seq_out_len',type=int,default=36,help='output sequence length')
-parser.add_argument('--horizon', type=int, default=1) 
-parser.add_argument('--layers',type=int,default=5,help='number of layers')
-parser.add_argument('--batch_size',type=int,default=8,help='batch size')
-parser.add_argument('--lr',type=float,default=0.001,help='learning rate')
-parser.add_argument('--weight_decay',type=float,default=0.00001,help='weight decay rate')
-parser.add_argument('--clip',type=int,default=10,help='clip')
-parser.add_argument('--propalpha',type=float,default=0.05,help='prop alpha')
-parser.add_argument('--tanhalpha',type=float,default=3,help='tanh alpha')
-parser.add_argument('--epochs',type=int,default=200,help='')
-parser.add_argument('--num_split',type=int,default=1,help='number of splits for graphs')
-parser.add_argument('--step_size',type=int,default=100,help='step_size')
+parser.add_argument('--gcn_depth', type=int, default=2, help='graph convolution depth')
+parser.add_argument('--num_nodes', type=int, default=142, help='number of nodes/variables')
+parser.add_argument('--dropout', type=float, default=0.4, help='dropout rate')
+parser.add_argument('--subgraph_size', type=int, default=20, help='k')
+parser.add_argument('--node_dim', type=int, default=40, help='dim of nodes')
+parser.add_argument('--dilation_exponential', type=int, default=2, help='dilation exponential')
+parser.add_argument('--conv_channels', type=int, default=32, help='convolution channels')
+parser.add_argument('--residual_channels', type=int, default=32, help='residual channels')
+parser.add_argument('--skip_channels', type=int, default=64, help='skip channels')
+parser.add_argument('--end_channels', type=int, default=128, help='end channels')
+parser.add_argument('--in_dim', type=int, default=1, help='inputs dimension')
+parser.add_argument('--seq_in_len', type=int, default=36, help='input sequence length')
+parser.add_argument('--seq_out_len', type=int, default=36, help='output sequence length')
+parser.add_argument('--horizon', type=int, default=1)
+parser.add_argument('--layers', type=int, default=5, help='number of layers')
+parser.add_argument('--batch_size', type=int, default=16, help='batch size')
+parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
+parser.add_argument('--weight_decay', type=float, default=0.00000, help='weight decay rate')
+parser.add_argument('--clip', type=int, default=10, help='clip')
+parser.add_argument('--propalpha', type=float, default=0.05, help='prop alpha')
+parser.add_argument('--tanhalpha', type=float, default=3, help='tanh alpha')
+parser.add_argument('--epochs', type=int, default=50, help='')
+parser.add_argument('--num_split', type=int, default=1, help='number of splits for graphs')
+parser.add_argument('--step_size', type=int, default=100, help='step_size')
+parser.add_argument('--patience', type=int, default=100, help='scheduler patience')
 
 
-args = parser.parse_args()
+try:
+    args = parser.parse_args()
+except:
+    args = parser.parse_args(args=[])
 device = torch.device('cpu')
 torch.set_num_threads(3)
 
@@ -152,7 +157,13 @@ epochs=hp[-1]
 
 Data = DataLoaderS(args.data, 0.43, 0.30, device, args.horizon, args.seq_in_len, args.normalize,args.seq_out_len)
 
+print("Data loaded. Checking shape...")
+if len(Data.train[0].shape) == 4: # (Samples, C, N, T)
+    args.num_nodes = Data.train[0].shape[2]
+elif len(Data.train[0].shape) == 3: # (Samples, T, N) usually
+    args.num_nodes = Data.train[0].shape[2]
 
+print(f"Auto-detected num_nodes: {args.num_nodes}")
 
 model = gtnet(args.gcn_true, args.buildA_true, gcn_depth, args.num_nodes,
             device, Data.adj, dropout=dropout, subgraph_size=k,
@@ -188,6 +199,11 @@ try:
         print('epoch:',epoch)
         epoch_start_time = time.time()
         train_loss = train(Data, Data.train[0], Data.train[1], model, criterion, optim, args.batch_size)
+
+        save_path = Path(args.save)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+
     with open(args.save, 'wb') as f:
         torch.save(model, f)        
 except KeyboardInterrupt:
