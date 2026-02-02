@@ -8,11 +8,9 @@ import sys
 import os
 
 # Ensure scripts directory is in path for module imports
-if 'google.colab' in str(get_ipython()):
-    # 현재 경로를 sys.path에 추가
-    current_path = os.getcwd()
-    if current_path not in sys.path:
-        sys.path.append(current_path)
+script_dir = os.path.dirname(os.path.abspath(__file__))
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
 
 from net import gtnet
 from o_util import *
@@ -111,10 +109,7 @@ parser.add_argument('--num_split',type=int,default=1,help='number of splits for 
 parser.add_argument('--step_size',type=int,default=100,help='step_size')
 
 
-try:
-    args = parser.parse_args()
-except:
-    args = parser.parse_args(args=[])
+args = parser.parse_args()
 device = torch.device('cpu')
 torch.set_num_threads(3)
 
