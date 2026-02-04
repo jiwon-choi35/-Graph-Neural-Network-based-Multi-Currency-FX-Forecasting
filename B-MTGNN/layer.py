@@ -78,11 +78,7 @@ class mixprop(nn.Module):
 class dy_mixprop(nn.Module):
     def __init__(self,c_in,c_out,gdep,dropout,alpha):
         super(dy_mixprop, self).__init__()
-        
-        self.adj_gen_conv = nconv()
-       
-        self.prop_conv = dy_nconv()
-        
+        self.nconv = dy_nconv()
         self.mlp1 = linear((gdep+1)*c_in,c_out)
         self.mlp2 = linear((gdep+1)*c_in,c_out)
 
@@ -94,37 +90,33 @@ class dy_mixprop(nn.Module):
 
 
     def forward(self,x):
-        
+        #adj = adj + torch.eye(adj.size(0)).to(x.device)
+        #d = adj.sum(1)
         x1 = torch.tanh(self.lin1(x))
         x2 = torch.tanh(self.lin2(x))
-        
-        
-        adj = self.adj_gen_conv(x1.transpose(2,1),x2)
+        adj = self.nconv(x1.transpose(2,1),x2)
         adj0 = torch.softmax(adj, dim=2)
         adj1 = torch.softmax(adj.transpose(2,1), dim=2)
 
-        
         h = x
         out = [h]
         for i in range(self.gdep):
-           
-            h = self.alpha*x + (1-self.alpha)*self.prop_conv(h,adj0)
+            h = self.alpha*x + (1-self.alpha)*self.nconv(h,adj0)
             out.append(h)
         ho = torch.cat(out,dim=1)
         ho1 = self.mlp1(ho)
 
 
-        
         h = x
         out = [h]
         for i in range(self.gdep):
-           
-            h = self.alpha * x + (1 - self.alpha) * self.prop_conv(h, adj1)
+            h = self.alpha * x + (1 - self.alpha) * self.nconv(h, adj1)
             out.append(h)
         ho = torch.cat(out, dim=1)
         ho2 = self.mlp2(ho)
 
         return ho1+ho2
+
 
 
 class dilated_1D(nn.Module):
@@ -173,7 +165,6 @@ class graph_constructor(nn.Module):
 
         self.device = device
         self.k = k
-        self.k = min(self.k, self.nnodes)   # k
         self.dim = dim
         self.alpha = alpha
         self.static_feat = static_feat
@@ -193,7 +184,9 @@ class graph_constructor(nn.Module):
         adj = F.relu(torch.tanh(self.alpha*a))
         mask = torch.zeros(idx.size(0), idx.size(0)).to(self.device)
         mask.fill_(float('0'))
-        s1,t1 = (adj + torch.rand_like(adj)*0.01).topk(self.k,1)
+        # Ensure k doesn't exceed the number of nodes
+        k = min(self.k, idx.size(0))
+        s1,t1 = (adj + torch.rand_like(adj)*0.01).topk(k,1)
         mask.scatter_(1,t1,s1.fill_(1))
         adj = adj*mask
         return adj
@@ -255,7 +248,9 @@ class graph_undirected(nn.Module):
         adj = F.relu(torch.tanh(self.alpha*a))
         mask = torch.zeros(idx.size(0), idx.size(0)).to(self.device)
         mask.fill_(float('0'))
-        s1,t1 = adj.topk(self.k,1)
+        # Ensure k doesn't exceed the number of nodes
+        k = min(self.k, idx.size(0))
+        s1,t1 = adj.topk(k,1)
         mask.scatter_(1,t1,s1.fill_(1))
         adj = adj*mask
         return adj
@@ -297,7 +292,9 @@ class graph_directed(nn.Module):
         adj = F.relu(torch.tanh(self.alpha*a))
         mask = torch.zeros(idx.size(0), idx.size(0)).to(self.device)
         mask.fill_(float('0'))
-        s1,t1 = adj.topk(self.k,1)
+        # Ensure k doesn't exceed the number of nodes
+        k = min(self.k, idx.size(0))
+        s1,t1 = adj.topk(k,1)
         mask.scatter_(1,t1,s1.fill_(1))
         adj = adj*mask
         return adj

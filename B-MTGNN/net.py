@@ -1,22 +1,13 @@
-import torch
-import sys
-import os
-import time
-import random
-
-# Ensure scripts directory is in path for module imports
-current_dir = os.getcwd()
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
-
 from layer import *
+import sys
+import time
 from util import DataLoaderS
+import random
 
 fixed_seed=123
 
-# Modified for Exchange Rate Forecasting
 class gtnet(nn.Module):
-    def __init__(self, gcn_true, buildA_true, gcn_depth, num_nodes, device, predefined_A=None, static_feat=None, dropout=0.3, subgraph_size=15, node_dim=40, dilation_exponential=1, conv_channels=32, residual_channels=32, skip_channels=64, end_channels=128, seq_length=12, in_dim=1, out_dim=8, layers=3, propalpha=0.05, tanhalpha=3, layer_norm_affline=True):
+    def __init__(self, gcn_true, buildA_true, gcn_depth, num_nodes, device, predefined_A=None, static_feat=None, dropout=0.3, subgraph_size=20, node_dim=40, dilation_exponential=1, conv_channels=32, residual_channels=32, skip_channels=64, end_channels=128, seq_length=12, in_dim=2, out_dim=12, layers=3, propalpha=0.05, tanhalpha=3, layer_norm_affline=True):
         super(gtnet, self).__init__()
         self.gcn_true = gcn_true
         self.buildA_true = buildA_true
@@ -169,93 +160,4 @@ class gtnet(nn.Module):
         x = F.relu(skip)
         x = F.relu(self.end_conv_1(x))
         x = self.end_conv_2(x)
-
-        # === persistence(마지막 입력값) residual 추가 ===
-        # input: [B, 1, N, L], x: [B, H, N, 1]
-        base = input[:, :, :, -1:].repeat(1, x.size(1), 1, 1)
-        x = x + base
-
         return x
-    
-
-    @torch.no_grad()
-    def mc_predict(self, input, idx=None, mc_samples: int = 30, quantiles=(0.1, 0.9)):
-        """Monte-Carlo dropout uncertainty for multi-horizon forecast.
-
-        Returns:
-            mean:   [B, H, N, 1]
-            lower:  [B, H, N, 1]
-            upper:  [B, H, N, 1]
-        """
-        # preserve mode
-        was_training = self.training
-        try:
-            # enable dropout
-            self.train()
-            outs = []
-            for _ in range(int(mc_samples)):
-                outs.append(self.forward(input, idx))
-            outs = torch.stack(outs, dim=0)  # [S, B, H, N, 1]
-            mean = outs.mean(dim=0)
-            q_lo, q_hi = quantiles
-            lower = torch.quantile(outs, q_lo, dim=0)
-            upper = torch.quantile(outs, q_hi, dim=0)
-            return mean, lower, upper
-        finally:
-            self.train(was_training)
-
-    @torch.no_grad()
-    def plot_forecast(self,
-                      input,
-                      idx=None,
-                      node_names=None,
-                      target_channel: int = 0,
-                      mc_samples: int = 30,
-                      quantiles=(0.1, 0.9),
-                      title: str = "Exchange Rates",
-                      save_path: str = "forecast.png",
-                      show: bool = True):
-        """Generate a 'paper-like' plot: history + forecast with shaded interval.
-
-        - Uses the first sample in the batch.
-        - X-axis uses step index (0..L-1 for history, L..L+H-1 for forecast).
-        """
-        import matplotlib.pyplot as plt
-
-        mean, lower, upper = self.mc_predict(input, idx=idx, mc_samples=mc_samples, quantiles=quantiles)
-
-        # Shapes
-        # input: [B, C, N, L]
-        # mean : [B, H, N, 1]
-        x_hist = input[0, target_channel].detach().cpu().numpy()  # [N, L]
-        y_mean = mean[0, :, :, 0].detach().cpu().numpy().T       # [N, H]
-        y_lo   = lower[0, :, :, 0].detach().cpu().numpy().T      # [N, H]
-        y_hi   = upper[0, :, :, 0].detach().cpu().numpy().T      # [N, H]
-
-        N, L = x_hist.shape
-        H = y_mean.shape[1]
-
-        if node_names is None:
-            node_names = [f"Node{i}" for i in range(N)]
-
-        # Plot
-        plt.figure(figsize=(14, 7))
-        t_hist = list(range(L))
-        t_fore = list(range(L, L + H))
-
-        for i in range(N):
-            plt.plot(t_hist, x_hist[i], label=str(node_names[i]))
-            plt.plot(t_fore, y_mean[i], linestyle="--")
-            plt.fill_between(t_fore, y_lo[i], y_hi[i], alpha=0.15)
-
-        plt.title(title)
-        plt.ylabel("Trend")
-        plt.xlabel("Time")
-        plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=True)
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=200)
-        if show:
-            plt.show()
-        else:
-            plt.close()
-        return save_path

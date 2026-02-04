@@ -68,3 +68,5 @@ smoothed = list(map(list, zip(*smoothed)))
 with open("data/sm_data.csv", "w",newline="") as f:
     writer = csv.writer(f)
     writer.writerows(smoothed [:-1]) #do not include the last extra row
+
+

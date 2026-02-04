@@ -1,70 +1,120 @@
-import torch
-from torch.nn.utils import clip_grad_norm_
+import torch.optim as optim
+import math
+from net import *
+import util
+class Trainer():
+    def __init__(self, model, lrate, wdecay, clip, step_size, seq_out_len, scaler, device, cl=True):
+        self.scaler = scaler
+        self.model = model
+        self.model.to(device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lrate, weight_decay=wdecay)
+        self.loss = util.masked_mae
+        self.clip = clip
+        self.step = step_size
+        self.iter = 1
+        self.task_level = 1
+        self.seq_out_len = seq_out_len
+        self.cl = cl
+
+    def train(self, input, real_val, idx=None):
+        self.model.train()
+        self.optimizer.zero_grad()
+        output = self.model(input, idx=idx)
+        output = output.transpose(1,3)
+        real = torch.unsqueeze(real_val,dim=1)
+        predict = self.scaler.inverse_transform(output)
+        if self.iter%self.step==0 and self.task_level<=self.seq_out_len:
+            self.task_level +=1
+        if self.cl:
+            loss = self.loss(predict[:, :, :, :self.task_level], real[:, :, :, :self.task_level], 0.0)
+        else:
+            loss = self.loss(predict, real, 0.0)
+
+        loss.backward()
+
+        if self.clip is not None:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip)
+
+        self.optimizer.step()
+        # mae = util.masked_mae(predict,real,0.0).item()
+        mape = util.masked_mape(predict,real,0.0).item()
+        rmse = util.masked_rmse(predict,real,0.0).item()
+        self.iter += 1
+        return loss.item(),mape,rmse
+
+    def eval(self, input, real_val):
+        self.model.eval()
+        output = self.model(input)
+        output = output.transpose(1,3)
+        real = torch.unsqueeze(real_val,dim=1)
+        predict = self.scaler.inverse_transform(output)
+        loss = self.loss(predict, real, 0.0)
+        mape = util.masked_mape(predict,real,0.0).item()
+        rmse = util.masked_rmse(predict,real,0.0).item()
+        return loss.item(),mape,rmse
 
 
-class Optim:
-    """
-    Wrapper optimizer used in edit_train_test.py
 
-    사용법 (edit_train_test.py 기준):
-        optim = Optim(
-            model.parameters(), args.optim, lr, args.clip, lr_decay=args.weight_decay
-        )
+class Optim(object):
 
-        ...
-        grad_norm = optim.step()
-    """
+    def _makeOptimizer(self):
+        if self.method == 'sgd':
+            self.optimizer = optim.SGD(self.params, lr=self.lr, weight_decay=self.lr_decay)
+        elif self.method == 'adagrad':
+            self.optimizer = optim.Adagrad(self.params, lr=self.lr, weight_decay=self.lr_decay)
+        elif self.method == 'adadelta':
+            self.optimizer = optim.Adadelta(self.params, lr=self.lr, weight_decay=self.lr_decay)
+        elif self.method == 'adam':
+            self.optimizer = optim.Adam(self.params, lr=self.lr, weight_decay=self.lr_decay)
+        else:
+            raise RuntimeError("Invalid optim method: " + self.method)
 
-    def __init__(self, params, optim: str, lr: float, clip: float, lr_decay: float = None):
-        """
-        params    : model.parameters()
-        optim     : 'adam', 'sgd', 'rmsprop' 등
-        lr        : learning rate
-        clip      : gradient clipping max norm
-        lr_decay  : 학습률 감소 비율 (None 이면 사용 안 함)
-        """
+    def __init__(self, params, method, lr, clip, lr_decay=1, start_decay_at=None):
+        self.params = list(params)  # careful: params may be a generator
+        self.last_ppl = None
         self.lr = lr
         self.clip = clip
+        self.method = method
         self.lr_decay = lr_decay
+        self.start_decay_at = start_decay_at
+        self.start_decay = False
 
-        optim = optim.lower()
-        if optim == "sgd":
-            self.optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9)
-        elif optim == "adam":
-            self.optimizer = torch.optim.Adam(params, lr=lr)
-        elif optim == "rmsprop":
-            self.optimizer = torch.optim.RMSprop(params, lr=lr)
-        else:
-            raise ValueError(f"Unsupported optimizer type: {optim}")
-
-        # clipping 대상 파라미터들 저장
-        self.params = list(self.optimizer.param_groups[0]["params"])
-
-        # lr_decay가 0<gamma<1 범위일 때만 지수 감소 스케줄러 사용
-        if lr_decay is not None and 0.0 < lr_decay < 1.0:
-            self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizer, gamma=lr_decay
-            )
-        else:
-            self.scheduler = None
+        self._makeOptimizer()
 
     def step(self):
-        """
-        gradient clipping + optimizer.step() + (optional) lr scheduler.step()
+        # Compute gradients norm.
+        grad_norm = 0
+        if self.clip is not None:
+            torch.nn.utils.clip_grad_norm_(self.params, self.clip)
 
-        return: grad_norm (없으면 0.0)
-        """
-        grad_norm = 0.0
-
-        # gradient clipping
-        if self.clip is not None and self.clip > 0:
-            grad_norm = float(clip_grad_norm_(self.params, self.clip))
-
-        # 파라미터 업데이트
+        # for param in self.params:
+        #     grad_norm += math.pow(param.grad.data.norm(), 2)
+        #
+        # grad_norm = math.sqrt(grad_norm)
+        # if grad_norm > 0:
+        #     shrinkage = self.max_grad_norm / grad_norm
+        # else:
+        #     shrinkage = 1.
+        #
+        # for param in self.params:
+        #     if shrinkage < 1:
+        #         param.grad.data.mul_(shrinkage)
         self.optimizer.step()
+        return  grad_norm
 
-        # lr decay 스케줄러가 있으면 한 스텝 진행
-        if self.scheduler is not None:
-            self.scheduler.step()
+    # decay learning rate if val perf does not improve or we hit the start_decay_at limit
+    def updateLearningRate(self, ppl, epoch):
+        if self.start_decay_at is not None and epoch >= self.start_decay_at:
+            self.start_decay = True
+        if self.last_ppl is not None and ppl > self.last_ppl:
+            self.start_decay = True
 
-        return grad_norm
+        if self.start_decay:
+            self.lr = self.lr * self.lr_decay
+            print("Decaying learning rate to %g" % self.lr)
+        #only decay for one epoch
+        self.start_decay = False
+
+        self.last_ppl = ppl
+
+        self._makeOptimizer()

@@ -1,0 +1,3 @@
+Best Val Score: -0.8632 (RSE: 0.0624, RAE: 0.0613, Corr: 0.9868)
+Test RSE: 16.8505 | Test RAE: 3.1713 | Test Corr: 0.9301
+Best HPs: [2, 0.002, 32, 64, 128, 128, 10, 0.2, 2, 40, 0.1, 4, 3]

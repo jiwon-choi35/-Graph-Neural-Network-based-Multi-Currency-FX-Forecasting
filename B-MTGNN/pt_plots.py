@@ -6,18 +6,10 @@ import torch
 from scipy.sparse import linalg
 from torch.autograd import Variable
 import sys
-
-# Ensure scripts directory is in path for module imports
-script_dir = os.path.dirname(os.path.abspath(__file__))
-if script_dir not in sys.path:
-    sys.path.insert(0, script_dir)
-
 import csv
 from collections import defaultdict
 from matplotlib import pyplot
 import random
-import pandas as pd
-import matplotlib.dates as mdates
 
 pyplot.rcParams['savefig.dpi'] = 1200
 
@@ -30,17 +22,14 @@ def exponential_smoothing(series, alpha):
     return result
 
 def consistent_name(name):
-
-    name=name.replace('-ALL','').replace('Mentions-','').replace(' ALL','').replace('Solution_','').replace('_Mentions','')
+    name_map = {
+        'kr_fx': 'Korean Won',
+        'us_Trade Weighted Dollar Index': 'US Dollar Index',
+        'jp_fx': 'Japanese Yen',
+        'us_fx': 'US FX'
+    }
+    if name in name_map: return name_map[name]
     
-    #special case
-    if 'HIDDEN MARKOV MODEL' in name:
-        return 'Statistical HMM'
-
-    if name=='CAPTCHA' or name=='DNSSEC' or name=='RRAM':
-        return name
-
-    #e.g., University of london
     if not name.isupper():
         words=name.split(' ')
         result=''
@@ -87,102 +76,41 @@ def zero_negative_curves(data, forecast, s):
       
 
 #plots past data and forecast of a single pertinent technology node s
-def plot_forecast(data,forecast,confidence,s,index,col, start_date='2011-01-01', freq='M'):
-
-    # keep original key for mapping decisions
-    s_key = s
-    data,forecast= zero_negative_curves(data, forecast, s_key)
-
-    pyplot.style.use("seaborn-v0_8-darkgrid") 
+def plot_forecast(data,forecast,confidence,s,index,col):
+    #pyplot.style.use("seaborn-dark")
     fig = pyplot.figure()
     ax = fig.add_axes([0.1, 0.1, 0.8, 0.8])
 
-    # Prepare series
-    d = torch.cat((data[:,index[s_key]],forecast[0:1,index[s_key]]),dim=0)  # connect past to future in the plot
-    f = forecast[:,index[s_key]]
-    c = confidence[:,index[s_key]]
+    #Plot the forecast
+    d=torch.cat((data[:,index[s]],forecast[0:1,index[s]]),dim=0)#connect the past to future in the plot
+    f=forecast[:,index[s]]
+    c=confidence[:,index[s]]
 
-    # Build date index (monthly by default) from provided start_date
-    total_len = len(d) + len(f) - 1
-    try:
-        dates = pd.date_range(start=pd.to_datetime(start_date), periods=total_len, freq=freq)
-    except Exception:
-        dates = pd.date_range(start=pd.to_datetime(start_date), periods=total_len, freq='M')
+    s_name=consistent_name(s)
+    ax.plot(range(len(d)),d,'-', color='red',label=s_name,linewidth = 1)#past
+    ax.plot(range(len(d)-1, (len(d)+len(f))-1),f,'-',color= 'red',linewidth=1)#future
+    ax.fill_between(range(len(d)-1, (len(d)+len(f))-1),f - c, f + c, color= 'red', alpha=0.4)
+      
+    # Updated timeframe: 2011-01 to 2025-12 (Actual) + 2026-01 to 2028-12 (Forecast)
+    years = [str(year) for year in range(2011, 2030)]
+    ticks = [i * 12 for i in range(len(years))]
+    ax.set_xticks(ticks, years)
 
-    # split past and forecast dates
-    past_dates = dates[:len(d)]
-    forecast_dates = dates[len(d)-1:]
-
-    # Display name mapping (make legend friendlier)
-    key_low = s_key.lower()
-    if key_low.startswith('us'):
-        display_name = 'US(1호선)'
-    elif key_low.startswith('kr'):
-        display_name = 'KR(2호선)'
-    elif key_low.startswith('uk'):
-        display_name = 'UK(3호선)'
-    elif key_low.startswith('jp'):
-        display_name = 'JP(4호선)'
-    elif key_low.startswith('cn'):
-        display_name = 'CN(5호선)'
-    else:
-        display_name = consistent_name(s_key)
-
-    # Determine line styles (US stays solid as requested)
-    is_us = key_low.startswith('us')
-    past_style = {'linestyle':'-', 'linewidth':1}
-    future_style = {'linestyle':'--', 'linewidth':1}
-    if is_us:
-        future_style['linestyle'] = '-'
-
-    # Plot past and future series with datetime x-axis
-    ax.plot(past_dates, d, color='red', label=display_name, **past_style)
-    ax.plot(forecast_dates, f, color='red', **future_style)
-
-    # Confidence band: prefer percentile-based band if raw `outputs` available, otherwise scale down provided `confidence`
-    band_alpha = 0.08
-    band_scale = 0.5
-    try:
-        if 'outputs' in globals():
-            out_arr = outputs.numpy()  # shape (runs, steps, m)
-            # compute 10-90 percentile band and scale by global `scale` if present
-            lo = np.percentile(out_arr[:, :, index[s_key]], 10, axis=0)
-            hi = np.percentile(out_arr[:, :, index[s_key]], 90, axis=0)
-            if 'scale' in globals():
-                lo = lo * scale[index[s_key]]
-                hi = hi * scale[index[s_key]]
-            ax.fill_between(forecast_dates, lo, hi, color='red', alpha=band_alpha, linewidth=0, edgecolor='none')
-        else:
-            scaled_c = c * band_scale
-            ax.fill_between(forecast_dates, f - scaled_c, f + scaled_c, color='red', alpha=band_alpha, linewidth=0, edgecolor='none')
-    except Exception:
-        # fallback to original confidence if anything fails
-        scaled_c = c * band_scale
-        ax.fill_between(forecast_dates, f - scaled_c, f + scaled_c, color='red', alpha=band_alpha, linewidth=0, edgecolor='none')
-
-    # Mark forecast start
-    forecast_start_date = forecast_dates[0]
-    ax.axvline(forecast_start_date, color='k', linestyle='--', linewidth=1)
-    ax.annotate('Forecast start', xy=(forecast_start_date, ax.get_ylim()[1]), xytext=(5, -15), textcoords='offset points', fontsize=10, ha='left', va='top')
-
-    # X-axis formatting: show years
-    ax.xaxis.set_major_locator(mdates.YearLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-    pyplot.xticks(rotation=90, fontsize=13)
-
-    ax.set_ylabel("Trend", fontsize=15)
+    ax.set_ylabel("Exchange Rate",fontsize=15)
     pyplot.yticks(fontsize=13)
+    ax.axis('tight')
     ax.grid(True)
-    pyplot.title(display_name, y=1.03, fontsize=18)
+    pyplot.xticks(rotation=90,fontsize=13)
+    pyplot.title(s_name, y=1.03,fontsize=18)
 
     fig = pyplot.gcf()
-    fig.set_size_inches(10, 7)
+    fig.set_size_inches(10, 7) 
 
-    # save and show the forecast
+    #save and show the forecast
     images_dir = 'model/Bayesian/forecast/pt_plots/'
-    safe_name = display_name.replace('/','_')
-    pyplot.savefig(images_dir+safe_name+'.png', bbox_inches="tight")
-    pyplot.savefig(images_dir+safe_name+".pdf", bbox_inches = "tight", format='pdf')
+    save_fn = s_name.replace(' ', '_').replace('/', '_')
+    pyplot.savefig(images_dir + save_fn + '.png', bbox_inches="tight")
+    pyplot.savefig(images_dir + save_fn + ".pdf", bbox_inches = "tight", format='pdf')
     pyplot.show(block=False)
     pyplot.pause(5)
     pyplot.close()
@@ -254,16 +182,27 @@ col,index=create_columns(nodes_file)
 #build the graph in the format {attack:list of pertinent technologies}
 graph=build_graph(graph_file)
 
-#for normalisation
-scale = np.ones(m)
-dat = np.zeros(rawdat.shape)
-
-#normalise
+# Log-Return Transformation (Matching Training Logic)
+min_val = np.min(rawdat, axis=0)
+shift = np.zeros(m)
 for i in range(m):
-    scale[i] = np.max(np.abs(rawdat[:, i]))
-    dat[:, i] = rawdat[:, i] / np.max(np.abs(rawdat[:, i]))
-    
+    if min_val[i] <= 0:
+        shift[i] = abs(min_val[i]) + 1.0
 
+shifted_rawdat = rawdat + shift
+log_rawdat = np.log(shifted_rawdat)
+returns = np.diff(log_rawdat, axis=0)
+
+# Standardization (Normalize=3 style)
+dat = np.zeros(returns.shape)
+means = np.zeros(m)
+stds = np.zeros(m)
+
+for i in range(m):
+    means[i] = np.mean(returns[:, i])
+    stds[i] = np.std(returns[:, i])
+    if stds[i] == 0: stds[i] = 1
+    dat[:, i] = (returns[:, i] - means[i]) / stds[i]
 print('data shape:',dat.shape)
 
 #preparing last part of the data to be used for the forecast
@@ -279,7 +218,7 @@ X = X.to(torch.float)
 #load the model
 model=None
 with open(model_file, 'rb') as f:
-    model = torch.load(f)
+    model = torch.load(f, weights_only=False)
 
 
 # Bayesian estimation
@@ -307,68 +246,46 @@ std_dev = torch.std(outputs, dim=0)#standard deviation
 z=1.96
 confidence=z*std_dev/torch.sqrt(torch.tensor(num_runs))
 
-dat*=scale
-Y*=scale
-variance*=scale
-confidence*=scale
+# 1. Denormalize
+scale_tensor = torch.from_numpy(stds).float().to(Y.device)
+mean_tensor = torch.from_numpy(means).float().to(Y.device)
 
+Y_denorm = Y * scale_tensor + mean_tensor
+confidence_denorm = confidence * scale_tensor 
 
-print('output shape:',Y.shape)
+# 2. Price Reconstruction (Actual FX Rates)
+shift_t = torch.from_numpy(shift).float().to(Y.device)
+Y_price = []
+current_p = torch.from_numpy(rawdat[-1]).float().to(Y.device)
+
+for t in range(Y_denorm.shape[0]):
+    # Formula: P_t = (P_{t-1} + shift) * exp(ret_t) - shift
+    current_p = (current_p + shift_t) * torch.exp(Y_denorm[t]) - shift_t
+    Y_price.append(current_p)
+Y_price = torch.stack(Y_price)
+
+# Confidence interval in price space
+v_factor = 5.0 # Visibility multiplier: 오차율 보정치 강제 추가
+confidence_price = (Y_price * confidence_denorm) * v_factor
+
+# Final Plotting Data (Actual Prices)
+dat_final = torch.from_numpy(rawdat).float().to(Y.device)
+Y_final = Y_price
+confidence_final = confidence_price
+
+print('output shape:', Y_final.shape)
 
 #----------------------------------------------------------------------------------------------------#
-
 #Plotting:
-
-
-
-
-#combine data
-dat=torch.from_numpy(dat)
-all=torch.cat((dat,Y), dim=0)
-
-
-#scale down full data (global normalisation)
-incident_max=-999999999
-mention_max=-999999999
-
-for i in range(all.shape[0]):
-    for j in range(all.shape[1]):
-        if 'WAR' in col[j] or 'Holiday' in col[j] or j in range(16,32):
-            continue
-        if 'Mention' in col[j]:
-            if all[i,j]>mention_max:
-                mention_max=all[i,j]
-        else:
-            if all[i,j]>incident_max:
-                incident_max=all[i,j]
-
-all_n=torch.zeros(all.shape[0],all.shape[1])
-confidence_n=torch.zeros(confidence.shape[0],confidence.shape[1])
-u=0
-for i in range(all.shape[0]):
-    for j in range(all.shape[1]):
-            if 'Mention' in col[j]:
-                all_n[i,j]=all[i,j]/mention_max
-            else:
-                all_n[i,j]=all[i,j]/incident_max
-            
-            if i>=all.shape[0]-36:
-                confidence_n[u,j]=confidence[u,j]*(all_n[i,j]/all[i,j])
-    if i>=all.shape[0]-36:
-        u+=1
-
+#combine data (past + future)
+all_data = torch.cat((dat_final, Y_final), dim=0)
 
 #smoothing
-smoothed_dat=torch.stack(exponential_smoothing(all_n, 0.1))
-smoothed_confidence=torch.stack(exponential_smoothing(confidence_n, 0.1))
+smoothed_dat = torch.stack(exponential_smoothing(all_data, 0.1))
+smoothed_confidence = torch.stack(exponential_smoothing(confidence_final, 0.1))
 
-
-
-
-done=[]
-#plot all forecasted pertinent technologies
-for attack, solutions in graph.items():
-    for s in solutions:
-        if not s in done:
-            done.append(s)
-            plot_forecast(smoothed_dat[:-36,],smoothed_dat[-36:,], smoothed_confidence,s,index,col)
+#plot specific target currencies only
+target_nodes = ['us_Trade Weighted Dollar Index', 'kr_fx', 'jp_fx']
+for node_name in target_nodes:
+    if node_name in index:
+        plot_forecast(smoothed_dat[:-36,], smoothed_dat[-36:,], smoothed_confidence, node_name, index, col)
