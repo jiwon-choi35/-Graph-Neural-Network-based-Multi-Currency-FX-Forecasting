@@ -16,6 +16,8 @@ import time
 import os
 from pathlib import Path
 
+import glob
+
 plt.rcParams['savefig.dpi'] = 1200
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -117,30 +119,37 @@ def save_metrics_1d(predict, test, title, type):
 
 
 def plot_predicted_actual(predicted, actual, title, type, variance, confidence_95):
-    months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-    M = []
-    for year in range(11, 23):
+
+    months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+    M=[]
+    for year in range (11,26):   
         for month in months:
-            if year == 11 and month not in ['Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']:
+            if year==11 and month not in ['Jul','Aug','Sep','Oct','Nov','Dec']:
                 continue
-            M.append(month + '-' + str(year))
-    M2 = []
-    p = []
+            M.append(month+'-'+str(year))   
+    M2=[]
+    p=[]
     
-    if type == 'Testing':
-        M = M[-len(predicted):]
-        for index, value in enumerate(M):
+    #last 3 years
+    if type=='Testing':
+        M=M[-len(predicted):]
+        for index,value in enumerate(M):
             if 'Dec' in M[index] or 'Mar' in M[index] or 'Jun' in M[index] or 'Sep' in M[index]:
                 M2.append(M[index])
-                p.append(index + 1)
+                p.append(index+1) 
     
     else:
-        M = M[63:99]
-        for index, value in enumerate(M):
+        M = [m for m in M if '-24' in m]
+
+        if len(M) > len(predicted):
+            M = M[:len(predicted)]
+
+        for index,value in enumerate(M):
             if 'Dec' in M[index] or 'Mar' in M[index] or 'Jun' in M[index] or 'Sep' in M[index]:
                 M2.append(M[index])
-                p.append(index + 1)
+                p.append(index+1) 
 
+    # === 그래프 그리기 ===
     x = range(1, len(predicted) + 1)
     plt.plot(x, actual, 'b-', label='Actual')
     plt.plot(x, predicted, '--', color='purple', label='Predicted')
@@ -151,10 +160,13 @@ def plot_predicted_actual(predicted, actual, title, type, variance, confidence_9
     plt.title(title, y=1.03, fontsize=18)
     plt.ylabel("Trend", fontsize=15)
     plt.xlabel("Month", fontsize=15)
+    
+    # X축 라벨 적용
     locs, labs = plt.xticks()
     plt.xticks(ticks=p, labels=M2, rotation='vertical', fontsize=13)
     plt.yticks(fontsize=13)
     
+    # === 파일 저장 ===
     fig = plt.gcf()
     title = title.replace('/', '_')
     
@@ -185,7 +197,12 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
     test = None
     variance = None
     confidence_95 = None
-    r = 0 
+
+    # ============================================
+    # 기존 : r=0
+    # 0 대신 다른 숫자로 변경해서 데이터가 있는지 확인
+    # ============================================
+    r = 5
     print('testing r=', str(r))
     scale = data.scale.expand(test_window.size(0), data.m)
     print('Test Window Feature:', test_window[:, r])
@@ -247,6 +264,9 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
             variance = torch.cat((variance, var))
             confidence_95 = torch.cat((confidence_95, confidence))
 
+    # =============================================
+    # 스케일 복원 코드
+    # =============================================
     scale = data.scale.expand(test.size(0), data.m)
     predict *= scale
     test *= scale
@@ -293,10 +313,16 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
     if is_plot:
         # [수정] 범위 수정 가능 (예: 전체 노드 대신 일부만)
         # 만약 실제 노드가 32개라면 r + 142는 에러가 날 수 있으므로 r + data.m으로 수정하는 것이 좋습니다.
-        loop_end = min(r + 142, data.m) 
-        for v in range(r, loop_end):
-            col = v % data.m
-            node_name = data.col[col].replace('-ALL', '').replace('Mentions-', 'Mentions of ').replace(' ALL', '').replace('Solution_', '').replace('_Mentions', '')
+        target_nodes = ['us_Trade Weighted Dollar Index', 'kr_fx', 'jp_fx']
+
+        for v in range(data.m):
+            col = v
+            raw_name = data.col[col]
+            
+            if raw_name not in target_nodes:
+                continue
+
+            node_name = raw_name.replace('-ALL', '').replace('Mentions-', 'Mentions of ').replace(' ALL', '').replace('Solution_', '').replace('_Mentions', '')
             node_name = consistent_name(node_name)
             
             save_metrics_1d(torch.from_numpy(predict[:, col]), torch.from_numpy(Ytest[:, col]), node_name, 'Testing')
@@ -316,7 +342,12 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
     confidence_95 = None
     sum_squared_diff = 0
     sum_absolute_diff = 0
-    r = 0
+    
+    # ============================================
+    # 기존 : r=0
+    # 0 대신 다른 숫자로 변경해서 데이터가 있는지 확인
+    # ============================================
+    r = 5
     print('validation r=', str(r))
 
     for X, Y in data.get_batches(X, Y, batch_size, False):
@@ -343,6 +374,10 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
         confidence = z * std_dev / torch.sqrt(torch.tensor(num_runs))
 
         output = mean
+
+        # =============================================
+        # 스케일 복원 코드
+        # =============================================
         scale = data.scale.expand(Y.size(0), Y.size(1), data.m)
         
         output *= scale
@@ -413,10 +448,17 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
     counter = 0
     if is_plot:
         # [수정] loop 범위 수정 (에러 방지)
-        loop_end = min(r + 142, data.m)
-        for v in range(r, loop_end):
-            col = v % data.m
-            node_name = DataLoaderS.col[col].replace('-ALL', '').replace('Mentions-', 'Mentions of ').replace(' ALL', '').replace('Solution_', '').replace('_Mentions', '')
+        target_nodes = ['us_Trade Weighted Dollar Index', 'kr_fx', 'jp_fx']
+
+        for v in range(data.m):
+            col = v
+            raw_name = data.col[col]
+
+            # [필터링 로직]
+            if raw_name not in target_nodes:
+                continue
+
+            node_name = raw_name.replace('-ALL', '').replace('Mentions-', 'Mentions of ').replace(' ALL', '').replace('Solution_', '').replace('_Mentions', '')
             node_name = consistent_name(node_name)
             save_metrics_1d(torch.from_numpy(predict[-1, :, col]), torch.from_numpy(Ytest[-1, :, col]), node_name, 'Validation')
             plot_predicted_actual(predict[-1, :, col], Ytest[-1, :, col], node_name, 'Validation', variance[-1, :, col], confidence_95[-1, :, col])
@@ -449,11 +491,15 @@ def train(data, X, Y, model, criterion, optim, batch_size):
             ty = Y[:, :, :]
             output = model(tx)
             output = torch.squeeze(output, 3)
-            scale = data.scale.expand(output.size(0), output.size(1), data.m)
-            scale = scale[:, :, :]
 
-            output *= scale
-            ty *= scale
+            # ===================================
+            # [수정] 스케일 복원 부분 제거/주석 처리
+            # 모델은 작은 숫자(정규화된 값)로 학습하는 것이 훨씬 안정적
+            # ===================================
+            # scale = data.scale.expand(output.size(0), output.size(1), data.m)
+            # scale = scale[:, :, :]
+            # output *= scale
+            # ty *= scale
 
             loss = criterion(output, ty)
             loss.backward()
@@ -472,21 +518,18 @@ DEFAULT_DATA_PATH = AXIS_DIR / 'ExchangeRate_dataset.csv'
 DEFAULT_MODEL_SAVE = MODEL_BASE_DIR / 'model.pt'
 
 parser = argparse.ArgumentParser(description='PyTorch Time series forecasting')
-parser.add_argument('--data', type=str, default=str(DEFAULT_DATA_PATH),
-                    help='location of the data file')
-parser.add_argument('--log_interval', type=int, default=2000, metavar='N',
-                    help='report interval')
-parser.add_argument('--save', type=str, default=str(DEFAULT_MODEL_SAVE),
-                    help='path to save the final model')
+parser.add_argument('--data', type=str, default=str(DEFAULT_DATA_PATH), help='location of the data file')
+parser.add_argument('--log_interval', type=int, default=2000, metavar='N', help='report interval')
+parser.add_argument('--save', type=str, default=str(DEFAULT_MODEL_SAVE), help='path to save the final model')
 parser.add_argument('--optim', type=str, default='adam')
-parser.add_argument('--L1Loss', type=bool, default=True)
+parser.add_argument('--L1Loss', type=bool, default=False)
 parser.add_argument('--normalize', type=int, default=2)
 parser.add_argument('--device', type=str, default='cuda:1', help='')
 parser.add_argument('--gcn_true', type=bool, default=True, help='whether to add graph convolution layer')
 parser.add_argument('--buildA_true', type=bool, default=True, help='whether to construct adaptive adjacency matrix')
 parser.add_argument('--gcn_depth', type=int, default=2, help='graph convolution depth')
 parser.add_argument('--num_nodes', type=int, default=142, help='number of nodes/variables')
-parser.add_argument('--dropout', type=float, default=0.3, help='dropout rate')
+parser.add_argument('--dropout', type=float, default=0.4, help='dropout rate')
 parser.add_argument('--subgraph_size', type=int, default=20, help='k')
 parser.add_argument('--node_dim', type=int, default=40, help='dim of nodes')
 parser.add_argument('--dilation_exponential', type=int, default=2, help='dilation exponential')
@@ -495,23 +538,20 @@ parser.add_argument('--residual_channels', type=int, default=16, help='residual 
 parser.add_argument('--skip_channels', type=int, default=32, help='skip channels')
 parser.add_argument('--end_channels', type=int, default=64, help='end channels')
 parser.add_argument('--in_dim', type=int, default=1, help='inputs dimension')
-parser.add_argument('--seq_in_len', type=int, default=10, help='input sequence length')
+parser.add_argument('--seq_in_len', type=int, default=36, help='input sequence length')
 parser.add_argument('--seq_out_len', type=int, default=36, help='output sequence length')
 parser.add_argument('--horizon', type=int, default=1)
 parser.add_argument('--layers', type=int, default=5, help='number of layers')
-
-parser.add_argument('--batch_size', type=int, default=8, help='batch size')
-parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
-parser.add_argument('--weight_decay', type=float, default=0.00001, help='weight decay rate')
-
+parser.add_argument('--batch_size', type=int, default=16, help='batch size')
+parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
+parser.add_argument('--weight_decay', type=float, default=0.00000, help='weight decay rate')
 parser.add_argument('--clip', type=int, default=10, help='clip')
-
 parser.add_argument('--propalpha', type=float, default=0.05, help='prop alpha')
 parser.add_argument('--tanhalpha', type=float, default=3, help='tanh alpha')
-
-parser.add_argument('--epochs', type=int, default=100, help='')
+parser.add_argument('--epochs', type=int, default=50, help='')
 parser.add_argument('--num_split', type=int, default=1, help='number of splits for graphs')
 parser.add_argument('--step_size', type=int, default=100, help='step_size')
+parser.add_argument('--patience', type=int, default=5, help='scheduler patience')
 
 
 args = parser.parse_args()
@@ -559,22 +599,61 @@ def main(experiment):
 
     best_hp = []
 
-    for q in range(60):
-        gcn_depth = gcn_depths[randrange(len(gcn_depths))]
-        lr = lrs[randrange(len(lrs))]
-        conv = convs[randrange(len(convs))]
-        res = ress[randrange(len(ress))]
-        skip = skips[randrange(len(skips))]
-        end = ends[randrange(len(ends))]
-        layer = layers[randrange(len(layers))]
-        k = ks[randrange(len(ks))]
-        dropout = dropouts[randrange(len(dropouts))]
-        dilation_ex = dilation_exs[randrange(len(dilation_exs))]
-        node_dim = node_dims[randrange(len(node_dims))]
-        prop_alpha = prop_alphas[randrange(len(prop_alphas))]
-        tanh_alpha = tanh_alphas[randrange(len(tanh_alphas))]
+    for q in range(1):
+        gcn_depth = args.gcn_depth
+        lr = args.lr
+        conv = args.conv_channels
+        res = args.residual_channels
+        skip = args.skip_channels
+        end = args.end_channels
+        layer = args.layers
+        k = args.subgraph_size
+        dropout = args.dropout
+        dilation_ex = args.dilation_exponential
+        node_dim = args.node_dim
+        prop_alpha = args.propalpha
+        tanh_alpha = args.tanhalpha
 
-        Data = DataLoaderS(args.data, 0.43, 0.30, device, args.horizon, args.seq_in_len, args.normalize, args.seq_out_len)
+        # =======================================================================
+        # 설정값을 무시하고 랜덤으로 하이퍼파라미터를 뽑는 코드(Random Search) 주석 처리
+        # =======================================================================
+        # gcn_depth = gcn_depths[randrange(len(gcn_depths))]
+        # lr = lrs[randrange(len(lrs))]
+        # conv = convs[randrange(len(convs))]
+        # res = ress[randrange(len(ress))]
+        # skip = skips[randrange(len(skips))]
+        # end = ends[randrange(len(ends))]
+        # layer = layers[randrange(len(layers))]
+        # k = ks[randrange(len(ks))]
+        # dropout = dropouts[randrange(len(dropouts))]
+        # dilation_ex = dilation_exs[randrange(len(dilation_exs))]
+        # node_dim = node_dims[randrange(len(node_dims))]
+        # prop_alpha = prop_alphas[randrange(len(prop_alphas))]
+        # tanh_alpha = tanh_alphas[randrange(len(tanh_alphas))]
+
+        # ============================================================
+        # [긴급 추가] 유령 파일 강제 삭제 코드
+        # 프로그램이 시작될 때마다 옛날 데이터 파일(.pt)을 무조건 지워버립니다.
+        # ============================================================
+        data_dir = os.path.dirname(args.data) # 예: C:\AXIS
+        pt_files = glob.glob(os.path.join(data_dir, "*.pt")) # 폴더 내의 모든 .pt 파일 찾기
+        
+        print(f"!!! Cleaning Cache Files in {data_dir} !!!")
+        for file_path in pt_files:
+            # model.pt는 지우면 안 되므로 제외 (데이터 파일만 삭제)
+            if "model" not in file_path: 
+                try:
+                    os.remove(file_path)
+                    print(f"Deleted: {file_path}")
+                except Exception as e:
+                    print(f"Error deleting {file_path}: {e}")
+        print("!!! Cache Clean Complete !!!")
+        # ============================================================
+
+        # ==================================================================
+        # 강제로 args.normalze를 무시고 무조건 1(최대값 나누기)로 동작하도록 수정
+        # ===================================================================
+        Data = DataLoaderS(args.data, 0.43, 0.30, device, args.horizon, args.seq_in_len, 2, args.seq_out_len)
 
         print('train X:', Data.train[0].shape)
         print('train Y:', Data.train[1].shape)
@@ -624,6 +703,10 @@ def main(experiment):
             model.parameters(), args.optim, lr, args.clip, lr_decay=args.weight_decay
         )
 
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optim.optimizer, mode='min', factor=0.5, patience=args.patience
+        )
+
         es_counter = 0
         try:
             print('begin training')
@@ -650,6 +733,13 @@ def main(experiment):
                 print(
                     '| end of epoch {:3d} | time: {:5.2f}s | train_loss {:5.4f} | valid rse {:5.4f} | valid rae {:5.4f} | valid corr  {:5.4f} | valid smape  {:5.4f}'.format(
                         epoch, (time.time() - epoch_start_time), train_loss, val_loss, val_rae, val_corr, val_smape), flush=True)
+                
+                # [추가] 스케줄러 업데이트 (성능이 정체되면 학습률 감소)
+                scheduler.step(val_loss)
+                
+                # [선택] 현재 학습률 출력 (확인용)
+                current_lr = optim.optimizer.param_groups[0]['lr']
+                print(f"  -> Current LR: {current_lr:.8f}", flush=True)
                 
                 sum_loss = val_loss + val_rae - val_corr
                 if (not math.isnan(val_corr)) and val_loss < best_rse:

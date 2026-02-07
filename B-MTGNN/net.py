@@ -1,16 +1,9 @@
+from layer import *
 import torch
 import sys
-import os
 import time
-import random
-
-# Ensure scripts directory is in path for module imports
-script_dir = os.path.dirname(os.path.abspath(__file__))
-if script_dir not in sys.path:
-    sys.path.insert(0, script_dir)
-
-from layer import *
 from util import DataLoaderS
+import random
 
 fixed_seed=123
 

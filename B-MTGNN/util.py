@@ -103,6 +103,10 @@ class DataLoaderS(object):
                 df = df.iloc[:, 1:]
 
             df = df.apply(pd.to_numeric, errors='coerce')
+
+            # 과거 데이터의 작은 구멍은 앞의 값으로 채워줌
+            # df = df.fillna(method='ffill', limit=5)
+
             df = df.fillna(0)
             self.rawdat_np = df.values.astype(float)
             print("Data loaded and converted to numeric successfully.")
