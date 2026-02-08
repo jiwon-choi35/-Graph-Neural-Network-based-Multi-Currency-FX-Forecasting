@@ -119,10 +119,10 @@ def save_metrics_1d(predict, test, title, type):
 
 
 def plot_predicted_actual(predicted, actual, title, type, variance, confidence_95):
-
     months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
     M=[]
-    for year in range (11,26):   
+    # 2011년부터 2026년까지 넉넉하게 라벨 생성
+    for year in range (11, 27):   
         for month in months:
             if year==11 and month not in ['Jul','Aug','Sep','Oct','Nov','Dec']:
                 continue
@@ -130,30 +130,39 @@ def plot_predicted_actual(predicted, actual, title, type, variance, confidence_9
     M2=[]
     p=[]
     
-    #last 3 years
-    if type=='Testing':
-        M=M[-len(predicted):]
-        for index,value in enumerate(M):
-            if 'Dec' in M[index] or 'Mar' in M[index] or 'Jun' in M[index] or 'Sep' in M[index]:
-                M2.append(M[index])
-                p.append(index+1) 
+    # === [수정] 날짜 필터링 로직 강화 ===
+    target_year = '25' if type == 'Testing' else '24'
     
-    else:
-        M = [m for m in M if '-24' in m]
+    # 1. 전체 라벨 중 해당 연도(24 or 25)가 포함된 것만 추출
+    target_labels = [m for m in M if f'-{target_year}' in m]
+    
+    # 2. 데이터 길이(predicted)가 라벨보다 짧으면, 뒤에서부터 맞춤
+    if len(target_labels) > len(predicted):
+        target_labels = target_labels[-len(predicted):]
+    
+    # 3. 데이터 길이가 라벨보다 길면, 데이터의 뒷부분만 사용 (최신 데이터 우선)
+    elif len(predicted) > len(target_labels):
+        diff = len(predicted) - len(target_labels)
+        predicted = predicted[diff:]
+        actual = actual[diff:]
+        confidence_95 = confidence_95[diff:]
 
-        if len(M) > len(predicted):
-            M = M[:len(predicted)]
-
-        for index,value in enumerate(M):
-            if 'Dec' in M[index] or 'Mar' in M[index] or 'Jun' in M[index] or 'Sep' in M[index]:
-                M2.append(M[index])
-                p.append(index+1) 
+    M = target_labels
+    
+    # X축 틱 설정 (분기별)
+    for index, value in enumerate(M):
+        if 'Dec' in value or 'Mar' in value or 'Jun' in value or 'Sep' in value:
+            M2.append(value)
+            p.append(index+1) 
 
     # === 그래프 그리기 ===
     x = range(1, len(predicted) + 1)
+    
     plt.plot(x, actual, 'b-', label='Actual')
     plt.plot(x, predicted, '--', color='purple', label='Predicted')
-    plt.fill_between(x, predicted - confidence_95.numpy(), predicted + confidence_95.numpy(), alpha=0.5, color='pink', label='95% Confidence')
+    if isinstance(confidence_95, torch.Tensor):
+        confidence_95 = confidence_95.cpu().numpy()
+    plt.fill_between(x, predicted - confidence_95, predicted + confidence_95, alpha=0.5, color='pink', label='95% Confidence')
     plt.legend(loc="best", prop={'size': 11})
     plt.axis('tight')
     plt.grid(True)
@@ -162,7 +171,6 @@ def plot_predicted_actual(predicted, actual, title, type, variance, confidence_9
     plt.xlabel("Month", fontsize=15)
     
     # X축 라벨 적용
-    locs, labs = plt.xticks()
     plt.xticks(ticks=p, labels=M2, rotation='vertical', fontsize=13)
     plt.yticks(fontsize=13)
     
@@ -174,8 +182,6 @@ def plot_predicted_actual(predicted, actual, title, type, variance, confidence_9
     save_dir.mkdir(parents=True, exist_ok=True)
     
     plt.savefig(save_dir / f"{title}_{type}.png", bbox_inches="tight")
-    # plt.savefig(save_dir / f"{title}_{type}.pdf", bbox_inches="tight", format='pdf')
-
     plt.show(block=False)
     plt.pause(2)
     plt.close()
@@ -199,25 +205,28 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
     confidence_95 = None
 
     # ============================================
-    # 기존 : r=0
-    # 0 대신 다른 숫자로 변경해서 데이터가 있는지 확인
-    # ============================================
     r = 5
     print('testing r=', str(r))
-    scale = data.scale.expand(test_window.size(0), data.m)
+    test_window = test_window.to(data.device)
     print('Test Window Feature:', test_window[:, r])
     
     x_input = test_window[0:n_input, :].clone()
 
     for i in range(n_input, test_window.shape[0], data.out_len):
-        print('**************x_input*******************')
-        print(x_input[:, r])
-        print('**************-------*******************')
-
         X = torch.unsqueeze(x_input, dim=0)
         X = torch.unsqueeze(X, dim=1)
-        X = X.transpose(2, 3)
+        X = X.transpose(2, 3)  # [1, 1, N, T]
         X = X.to(torch.float)
+
+        # ===== RevIN: Per-Window Normalization =====
+        w_mean = X.mean(dim=-1, keepdim=True)  # [1, 1, N, 1]
+        w_std = X.std(dim=-1, keepdim=True)    # [1, 1, N, 1]
+        w_std[w_std == 0] = 1
+        X = (X - w_mean) / w_std
+
+        wm = w_mean[0, 0, :, 0]  # [N]
+        ws = w_std[0, 0, :, 0]   # [N]
+        # ============================================
 
         y_true = test_window[i: i + data.out_len, :].clone()
 
@@ -228,6 +237,9 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
             with torch.no_grad():
                 output = model(X)
                 y_pred = output[-1, :, :, -1].clone()
+                # ===== RevIN Denormalize (back to z-score space) =====
+                y_pred = y_pred * ws + wm
+                # =====================================================
                 if y_pred.shape[0] > y_true.shape[0]:
                     y_pred = y_pred[:-(y_pred.shape[0] - y_true.shape[0]), ]
             outputs.append(y_pred)
@@ -245,14 +257,6 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
         else:
             x_input = torch.cat([x_input[-(data.P - data.out_len):, :].clone(), y_pred.clone()], dim=0)
 
-        print('----------------------------Predicted months', str(i - n_input + 1), 'to', str(i - n_input + data.out_len), '--------------------------------------------------')
-        print(y_pred.shape, y_true.shape)
-        y_pred_o = y_pred
-        y_true_o = y_true
-        for z in range(y_true.shape[0]):
-            print(y_pred_o[z, r], y_true_o[z, r])
-        print('------------------------------------------------------------------------------------------------------------')
-
         if predict is None:
             predict = y_pred
             test = y_true
@@ -265,11 +269,12 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
             confidence_95 = torch.cat((confidence_95, confidence))
 
     # =============================================
-    # 스케일 복원 코드
+    # [중요] Evaluate 단계에서는 Scale을 복원합니다.
     # =============================================
     scale = data.scale.expand(test.size(0), data.m)
-    predict *= scale
-    test *= scale
+    shift = data.shift.expand(test.size(0), data.m)
+    predict = predict * scale + shift
+    test = test * scale + shift
     variance *= scale
     confidence_95 *= scale
 
@@ -300,9 +305,12 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
     sigma_g = (Ytest).std(axis=0)
     mean_p = predict.mean(axis=0)
     mean_g = Ytest.mean(axis=0)
-    index = (sigma_g != 0)
-    correlation = ((predict - mean_p) * (Ytest - mean_g)).mean(axis=0) / (sigma_p * sigma_g)
-    correlation = (correlation[index]).mean()
+    index = (sigma_g != 0) & (sigma_p != 0)
+    if index.sum() > 0:
+        correlation = ((predict - mean_p) * (Ytest - mean_g)).mean(axis=0) / (sigma_p * sigma_g)
+        correlation = (correlation[index]).mean()
+    else:
+        correlation = 0.0
 
     smape = 0
     for z in range(Ytest.shape[1]):
@@ -311,8 +319,6 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
 
     counter = 0
     if is_plot:
-        # [수정] 범위 수정 가능 (예: 전체 노드 대신 일부만)
-        # 만약 실제 노드가 32개라면 r + 142는 에러가 날 수 있으므로 r + data.m으로 수정하는 것이 좋습니다.
         target_nodes = ['us_Trade Weighted Dollar Index', 'kr_fx', 'jp_fx']
 
         for v in range(data.m):
@@ -343,16 +349,22 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
     sum_squared_diff = 0
     sum_absolute_diff = 0
     
-    # ============================================
-    # 기존 : r=0
-    # 0 대신 다른 숫자로 변경해서 데이터가 있는지 확인
-    # ============================================
     r = 5
     print('validation r=', str(r))
 
     for X, Y in data.get_batches(X, Y, batch_size, False):
         X = torch.unsqueeze(X, dim=1)
-        X = X.transpose(2, 3)
+        X = X.transpose(2, 3)  # [B, 1, N, T]
+
+        # ===== RevIN: Per-Window Normalization =====
+        w_mean = X.mean(dim=-1, keepdim=True)  # [B, 1, N, 1]
+        w_std = X.std(dim=-1, keepdim=True)    # [B, 1, N, 1]
+        w_std[w_std == 0] = 1
+        X = (X - w_mean) / w_std
+
+        wm = w_mean[:, 0, :, 0]  # [B, N]
+        ws = w_std[:, 0, :, 0]   # [B, N]
+        # ============================================
 
         num_runs = 10
         outputs = []
@@ -360,9 +372,11 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
         with torch.no_grad():
             for _ in range(num_runs):
                 output = model(X)
-                output = torch.squeeze(output)
-                if len(output.shape) == 1 or len(output.shape) == 2:
-                    output = output.unsqueeze(dim=0)
+                output = output.squeeze(-1)  # [B, T, N, 1] → [B, T, N]
+                if len(output.shape) == 2:
+                    output = output.unsqueeze(dim=1)  # [B, N] → [B, 1, N]
+                elif len(output.shape) == 1:
+                    output = output.unsqueeze(dim=0).unsqueeze(dim=0)  # [N] → [1, 1, N]
                 outputs.append(output)
 
         outputs = torch.stack(outputs)
@@ -375,13 +389,20 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
 
         output = mean
 
+        # ===== RevIN Denormalize (back to z-score space) =====
+        output = output * ws.unsqueeze(1) + wm.unsqueeze(1)
+        var = var * ws.unsqueeze(1)
+        confidence = confidence * ws.unsqueeze(1)
+        # ======================================================
+
         # =============================================
-        # 스케일 복원 코드
+        # [중요] Global z-score Denormalize
         # =============================================
         scale = data.scale.expand(Y.size(0), Y.size(1), data.m)
+        shift = data.shift.expand(Y.size(0), Y.size(1), data.m)
         
-        output *= scale
-        Y *= scale
+        output = output * scale + shift
+        Y = Y * scale + shift
         var *= scale
         confidence *= scale
 
@@ -435,9 +456,12 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
     sigma_g = (Ytest).std(axis=0)
     mean_p = predict.mean(axis=0)
     mean_g = Ytest.mean(axis=0)
-    index = (sigma_g != 0)
-    correlation = ((predict - mean_p) * (Ytest - mean_g)).mean(axis=0) / (sigma_p * sigma_g)
-    correlation = (correlation[index]).mean()
+    index = (sigma_g != 0) & (sigma_p != 0)
+    if index.sum() > 0:
+        correlation = ((predict - mean_p) * (Ytest - mean_g)).mean(axis=0) / (sigma_p * sigma_g)
+        correlation = (correlation[index]).mean()
+    else:
+        correlation = 0.0
 
     smape = 0
     for x in range(Ytest.shape[0]):
@@ -447,21 +471,19 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
 
     counter = 0
     if is_plot:
-        # [수정] loop 범위 수정 (에러 방지)
         target_nodes = ['us_Trade Weighted Dollar Index', 'kr_fx', 'jp_fx']
 
         for v in range(data.m):
             col = v
             raw_name = data.col[col]
 
-            # [필터링 로직]
             if raw_name not in target_nodes:
                 continue
 
             node_name = raw_name.replace('-ALL', '').replace('Mentions-', 'Mentions of ').replace(' ALL', '').replace('Solution_', '').replace('_Mentions', '')
             node_name = consistent_name(node_name)
-            save_metrics_1d(torch.from_numpy(predict[-1, :, col]), torch.from_numpy(Ytest[-1, :, col]), node_name, 'Validation')
-            plot_predicted_actual(predict[-1, :, col], Ytest[-1, :, col], node_name, 'Validation', variance[-1, :, col], confidence_95[-1, :, col])
+            save_metrics_1d(torch.from_numpy(predict[:, 0, col]), torch.from_numpy(Ytest[:, 0, col]), node_name, 'Validation')
+            plot_predicted_actual(predict[:, 0, col], Ytest[:, 0, col], node_name, 'Validation', variance[:, 0, col], confidence_95[:, 0, col])
             counter += 1
     return rrse, rae, correlation, smape
 
@@ -475,7 +497,20 @@ def train(data, X, Y, model, criterion, optim, batch_size):
     for X, Y in data.get_batches(X, Y, batch_size, True):
         model.zero_grad()
         X = torch.unsqueeze(X, dim=1)
-        X = X.transpose(2, 3)
+        X = X.transpose(2, 3)  # [B, 1, N, T]
+
+        # ===== RevIN: Per-Window Normalization =====
+        w_mean = X.mean(dim=-1, keepdim=True)  # [B, 1, N, 1]
+        w_std = X.std(dim=-1, keepdim=True)    # [B, 1, N, 1]
+        w_std[w_std == 0] = 1
+        X = (X - w_mean) / w_std
+
+        # Normalize target Y using same window stats
+        wm = w_mean[:, 0, :, 0]  # [B, N]
+        ws = w_std[:, 0, :, 0]   # [B, N]
+        Y = (Y - wm.unsqueeze(1)) / ws.unsqueeze(1)  # [B, T_out, N]
+        # ============================================
+
         if iter % args.step_size == 0:
             perm = np.random.permutation(range(args.num_nodes))
         num_sub = int(args.num_nodes / args.num_split)
@@ -491,15 +526,6 @@ def train(data, X, Y, model, criterion, optim, batch_size):
             ty = Y[:, :, :]
             output = model(tx)
             output = torch.squeeze(output, 3)
-
-            # ===================================
-            # [수정] 스케일 복원 부분 제거/주석 처리
-            # 모델은 작은 숫자(정규화된 값)로 학습하는 것이 훨씬 안정적
-            # ===================================
-            # scale = data.scale.expand(output.size(0), output.size(1), data.m)
-            # scale = scale[:, :, :]
-            # output *= scale
-            # ty *= scale
 
             loss = criterion(output, ty)
             loss.backward()
@@ -522,41 +548,44 @@ parser.add_argument('--data', type=str, default=str(DEFAULT_DATA_PATH), help='lo
 parser.add_argument('--log_interval', type=int, default=2000, metavar='N', help='report interval')
 parser.add_argument('--save', type=str, default=str(DEFAULT_MODEL_SAVE), help='path to save the final model')
 parser.add_argument('--optim', type=str, default='adam')
-parser.add_argument('--L1Loss', type=bool, default=False)
-parser.add_argument('--normalize', type=int, default=2)
+parser.add_argument('--L1Loss', type=bool, default=True)
+parser.add_argument('--normalize', type=int, default=3)
 parser.add_argument('--device', type=str, default='cuda:1', help='')
 parser.add_argument('--gcn_true', type=bool, default=True, help='whether to add graph convolution layer')
 parser.add_argument('--buildA_true', type=bool, default=True, help='whether to construct adaptive adjacency matrix')
 parser.add_argument('--gcn_depth', type=int, default=2, help='graph convolution depth')
 parser.add_argument('--num_nodes', type=int, default=142, help='number of nodes/variables')
-parser.add_argument('--dropout', type=float, default=0.4, help='dropout rate')
+parser.add_argument('--dropout', type=float, default=0.2, help='dropout rate')
 parser.add_argument('--subgraph_size', type=int, default=20, help='k')
 parser.add_argument('--node_dim', type=int, default=40, help='dim of nodes')
 parser.add_argument('--dilation_exponential', type=int, default=2, help='dilation exponential')
-parser.add_argument('--conv_channels', type=int, default=16, help='convolution channels')
-parser.add_argument('--residual_channels', type=int, default=16, help='residual channels')
-parser.add_argument('--skip_channels', type=int, default=32, help='skip channels')
-parser.add_argument('--end_channels', type=int, default=64, help='end channels')
+parser.add_argument('--conv_channels', type=int, default=8, help='convolution channels')
+parser.add_argument('--residual_channels', type=int, default=8, help='residual channels')
+parser.add_argument('--skip_channels', type=int, default=16, help='skip channels')
+parser.add_argument('--end_channels', type=int, default=32, help='end channels')
 parser.add_argument('--in_dim', type=int, default=1, help='inputs dimension')
-parser.add_argument('--seq_in_len', type=int, default=36, help='input sequence length')
-parser.add_argument('--seq_out_len', type=int, default=36, help='output sequence length')
+parser.add_argument('--seq_in_len', type=int, default=24, help='input sequence length')
+parser.add_argument('--seq_out_len', type=int, default=1, help='output sequence length')
 parser.add_argument('--horizon', type=int, default=1)
-parser.add_argument('--layers', type=int, default=5, help='number of layers')
-parser.add_argument('--batch_size', type=int, default=16, help='batch size')
-parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
-parser.add_argument('--weight_decay', type=float, default=0.00000, help='weight decay rate')
+parser.add_argument('--layers', type=int, default=3, help='number of layers')
+parser.add_argument('--batch_size', type=int, default=4, help='batch size')
+parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
+parser.add_argument('--weight_decay', type=float, default=0.00001, help='weight decay rate')
 parser.add_argument('--clip', type=int, default=10, help='clip')
 parser.add_argument('--propalpha', type=float, default=0.05, help='prop alpha')
 parser.add_argument('--tanhalpha', type=float, default=3, help='tanh alpha')
-parser.add_argument('--epochs', type=int, default=50, help='')
+parser.add_argument('--epochs', type=int, default=200, help='')
 parser.add_argument('--num_split', type=int, default=1, help='number of splits for graphs')
 parser.add_argument('--step_size', type=int, default=100, help='step_size')
-parser.add_argument('--patience', type=int, default=5, help='scheduler patience')
 
 
 args = parser.parse_args()
-device = torch.device('cpu')
-torch.set_num_threads(3)
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+if device.type == 'cuda':
+    print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+else:
+    print("CUDA not available, using CPU")
+    torch.set_num_threads(3)
 
 
 def set_random_seed(seed):
@@ -614,33 +643,14 @@ def main(experiment):
         prop_alpha = args.propalpha
         tanh_alpha = args.tanhalpha
 
-        # =======================================================================
-        # 설정값을 무시하고 랜덤으로 하이퍼파라미터를 뽑는 코드(Random Search) 주석 처리
-        # =======================================================================
-        # gcn_depth = gcn_depths[randrange(len(gcn_depths))]
-        # lr = lrs[randrange(len(lrs))]
-        # conv = convs[randrange(len(convs))]
-        # res = ress[randrange(len(ress))]
-        # skip = skips[randrange(len(skips))]
-        # end = ends[randrange(len(ends))]
-        # layer = layers[randrange(len(layers))]
-        # k = ks[randrange(len(ks))]
-        # dropout = dropouts[randrange(len(dropouts))]
-        # dilation_ex = dilation_exs[randrange(len(dilation_exs))]
-        # node_dim = node_dims[randrange(len(node_dims))]
-        # prop_alpha = prop_alphas[randrange(len(prop_alphas))]
-        # tanh_alpha = tanh_alphas[randrange(len(tanh_alphas))]
-
         # ============================================================
-        # [긴급 추가] 유령 파일 강제 삭제 코드
-        # 프로그램이 시작될 때마다 옛날 데이터 파일(.pt)을 무조건 지워버립니다.
+        # Cache Cleaning
         # ============================================================
-        data_dir = os.path.dirname(args.data) # 예: C:\AXIS
-        pt_files = glob.glob(os.path.join(data_dir, "*.pt")) # 폴더 내의 모든 .pt 파일 찾기
+        data_dir = os.path.dirname(args.data) 
+        pt_files = glob.glob(os.path.join(data_dir, "*.pt"))
         
         print(f"!!! Cleaning Cache Files in {data_dir} !!!")
         for file_path in pt_files:
-            # model.pt는 지우면 안 되므로 제외 (데이터 파일만 삭제)
             if "model" not in file_path: 
                 try:
                     os.remove(file_path)
@@ -650,10 +660,7 @@ def main(experiment):
         print("!!! Cache Clean Complete !!!")
         # ============================================================
 
-        # ==================================================================
-        # 강제로 args.normalze를 무시고 무조건 1(최대값 나누기)로 동작하도록 수정
-        # ===================================================================
-        Data = DataLoaderS(args.data, 0.43, 0.30, device, args.horizon, args.seq_in_len, 2, args.seq_out_len)
+        Data = DataLoaderS(args.data, 0.60, 0.20, device, args.horizon, args.seq_in_len, args.normalize, args.seq_out_len)
 
         print('train X:', Data.train[0].shape)
         print('train Y:', Data.train[1].shape)
@@ -666,15 +673,11 @@ def main(experiment):
         print('length of training set=', Data.train[0].shape[0])
         print('length of validation set=', Data.valid[0].shape[0])
         print('length of testing set=', Data.test[0].shape[0])
-        print('valid=', int((0.43 + 0.3) * Data.n))
+        print('valid=', int((0.60 + 0.20) * Data.n))
 
-        # [중요 수정] 실제 데이터에 맞춰 노드 개수 재설정 (하드코딩된 142 -> 32로 자동 변경)
-        # Data.train[0] 형태가 (Samples, Time, Nodes)인 경우 2번 인덱스가 Node 수입니다.
-        if len(Data.train[0].shape) == 4: # (Samples, C, N, T)인 경우
+        if len(Data.train[0].shape) == 4: 
              args.num_nodes = Data.train[0].shape[2]
-        elif len(Data.train[0].shape) == 3: # (Samples, T, N) 혹은 (Samples, N, T)
-             # Transpose 로직상 Data.train[0]는 (Samples, T, N) 형태일 확률이 높음 (N=32)
-             # 따라서 마지막 차원을 사용합니다.
+        elif len(Data.train[0].shape) == 3: 
              args.num_nodes = Data.train[0].shape[2]
 
         print(f"Auto-detected num_nodes: {args.num_nodes}")
@@ -686,6 +689,7 @@ def main(experiment):
                       skip_channels=skip, end_channels=end,
                       seq_length=args.seq_in_len, in_dim=args.in_dim, out_dim=args.seq_out_len,
                       layers=layer, propalpha=prop_alpha, tanhalpha=tanh_alpha, layer_norm_affline=False)
+        model = model.to(device)
 
         print(args)
         print('The recpetive field size is', model.receptive_field)
@@ -704,7 +708,7 @@ def main(experiment):
         )
 
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optim.optimizer, mode='min', factor=0.5, patience=args.patience
+            optim.optimizer, mode='min', factor=0.5, patience=15
         )
 
         es_counter = 0
@@ -734,16 +738,11 @@ def main(experiment):
                     '| end of epoch {:3d} | time: {:5.2f}s | train_loss {:5.4f} | valid rse {:5.4f} | valid rae {:5.4f} | valid corr  {:5.4f} | valid smape  {:5.4f}'.format(
                         epoch, (time.time() - epoch_start_time), train_loss, val_loss, val_rae, val_corr, val_smape), flush=True)
                 
-                # [추가] 스케줄러 업데이트 (성능이 정체되면 학습률 감소)
                 scheduler.step(val_loss)
                 
-                # [선택] 현재 학습률 출력 (확인용)
-                current_lr = optim.optimizer.param_groups[0]['lr']
-                print(f"  -> Current LR: {current_lr:.8f}", flush=True)
-                
-                sum_loss = val_loss + val_rae - val_corr
-                if (not math.isnan(val_corr)) and val_loss < best_rse:
-                    # [수정] 모델 저장 경로 디렉토리 확인 및 생성
+                safe_corr = val_corr if not math.isnan(val_corr) else 0.0
+                sum_loss = val_loss + val_rae - safe_corr
+                if val_loss < best_rse:
                     save_path = Path(args.save)
                     save_path.parent.mkdir(parents=True, exist_ok=True)
                     
@@ -774,7 +773,6 @@ def main(experiment):
     print('best val loss=', best_val)
     print('best hps=', best_hp)
     
-    # [수정] hp.txt 저장 경로 수정
     hp_save_path = MODEL_BASE_DIR / 'hp.txt'
     hp_save_path.parent.mkdir(parents=True, exist_ok=True)
     with open(hp_save_path, "w") as f:
