@@ -1,0 +1,33 @@
+us_Trade Weighted Dollar Index,kr_fx,jp_fx,us_ret,us_ret_lag1,US_Interest_Rate,US_GDP,US_CPI,US_Employment,US_Unemployment,US_Trade_Balance,corr_us_kr,corr_us_jp,kr_us_spread,jp_us_spread
+kr_fx,us_Trade Weighted Dollar Index,jp_fx,kr_ret,kr_ret_lag1,KR_Interest_Rate,KR_GDP,KR_CPI,KR_Employment,KR_Unemployment,KR_Trade_Balance,corr_us_kr,corr_kr_jp,kr_us_spread,kr_jp_spread
+jp_fx,us_Trade Weighted Dollar Index,kr_fx,jp_ret,jp_ret_lag1,JP_Interest_Rate,JP_GDP,JP_CPI,JP_Employment,JP_Unemployment,JP_Trade_Balance,corr_us_jp,corr_kr_jp,jp_us_spread,kr_jp_spread
+us_ret,us_Trade Weighted Dollar Index,us_ret_lag1,kr_us_spread,jp_us_spread,kr_ret,jp_ret
+kr_ret,kr_fx,kr_ret_lag1,kr_us_spread,kr_jp_spread,us_ret,jp_ret
+jp_ret,jp_fx,jp_ret_lag1,jp_us_spread,kr_jp_spread,us_ret,kr_ret
+kr_us_spread,us_ret,kr_ret,corr_us_kr,us_Trade Weighted Dollar Index,kr_fx
+jp_us_spread,us_ret,jp_ret,corr_us_jp,us_Trade Weighted Dollar Index,jp_fx
+kr_jp_spread,kr_ret,jp_ret,corr_kr_jp,kr_fx,jp_fx
+corr_us_kr,us_Trade Weighted Dollar Index,kr_fx,kr_us_spread,us_ret,kr_ret
+corr_us_jp,us_Trade Weighted Dollar Index,jp_fx,jp_us_spread,us_ret,jp_ret
+corr_kr_jp,kr_fx,jp_fx,kr_jp_spread,kr_ret,jp_ret
+us_ret_lag1,us_ret,us_Trade Weighted Dollar Index
+kr_ret_lag1,kr_ret,kr_fx
+jp_ret_lag1,jp_ret,jp_fx
+US_Interest_Rate,us_Trade Weighted Dollar Index,US_GDP,US_CPI,US_Unemployment,KR_Interest_Rate,JP_Interest_Rate
+KR_Interest_Rate,kr_fx,KR_GDP,KR_CPI,KR_Unemployment,US_Interest_Rate,JP_Interest_Rate
+JP_Interest_Rate,jp_fx,JP_GDP,JP_CPI,JP_Unemployment,US_Interest_Rate,KR_Interest_Rate
+US_GDP,us_Trade Weighted Dollar Index,US_Interest_Rate,US_Employment,US_Trade_Balance,US_CPI
+KR_GDP,kr_fx,KR_Interest_Rate,KR_Employment,KR_Trade_Balance,KR_CPI
+JP_GDP,jp_fx,JP_Interest_Rate,JP_Employment,JP_Trade_Balance,JP_CPI
+US_CPI,us_Trade Weighted Dollar Index,US_Interest_Rate,US_GDP,US_Employment
+KR_CPI,kr_fx,KR_Interest_Rate,KR_GDP,KR_Employment
+JP_CPI,jp_fx,JP_Interest_Rate,JP_GDP,JP_Employment
+US_Employment,us_Trade Weighted Dollar Index,US_GDP,US_Unemployment,US_CPI
+KR_Employment,kr_fx,KR_GDP,KR_Unemployment,KR_CPI
+JP_Employment,jp_fx,JP_GDP,JP_Unemployment,JP_CPI
+US_Unemployment,us_Trade Weighted Dollar Index,US_Employment,US_Interest_Rate,US_GDP
+KR_Unemployment,kr_fx,KR_Employment,KR_Interest_Rate,KR_GDP
+JP_Unemployment,jp_fx,JP_Employment,JP_Interest_Rate,JP_GDP
+US_Trade_Balance,us_Trade Weighted Dollar Index,US_GDP,KR_Trade_Balance,JP_Trade_Balance
+KR_Trade_Balance,kr_fx,KR_GDP,US_Trade_Balance,JP_Trade_Balance
+JP_Trade_Balance,jp_fx,JP_GDP,US_Trade_Balance,KR_Trade_Balance
