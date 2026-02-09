@@ -494,6 +494,15 @@ def train(data, X, Y, model, criterion, optim, batch_size):
     n_samples = 0
     iter = 0
 
+    # ===== Target-Weighted Loss =====
+    target_nodes = ['us_Trade Weighted Dollar Index', 'kr_fx', 'jp_fx']
+    target_weight = torch.ones(data.m, device=device)
+    for i, col_name in enumerate(data.col):
+        if col_name in target_nodes:
+            target_weight[i] = 10.0
+    print(f"[Target-Weighted Loss] weights applied: { {data.col[i]: target_weight[i].item() for i in range(data.m) if target_weight[i] > 1} }")
+    # ==================================
+
     for X, Y in data.get_batches(X, Y, batch_size, True):
         model.zero_grad()
         X = torch.unsqueeze(X, dim=1)
@@ -527,7 +536,11 @@ def train(data, X, Y, model, criterion, optim, batch_size):
             output = model(tx)
             output = torch.squeeze(output, 3)
 
-            loss = criterion(output, ty)
+            # ===== Target-Weighted Loss =====
+            diff = torch.abs(output - ty) if args.L1Loss else (output - ty) ** 2
+            w = target_weight.unsqueeze(0).unsqueeze(0)  # [1, 1, N]
+            loss = (diff * w).sum()
+            # ==================================
             loss.backward()
             total_loss += loss.item()
             n_samples += (output.size(0) * output.size(1) * data.m)
@@ -628,20 +641,20 @@ def main(experiment):
 
     best_hp = []
 
-    for q in range(1):
-        gcn_depth = args.gcn_depth
-        lr = args.lr
-        conv = args.conv_channels
-        res = args.residual_channels
-        skip = args.skip_channels
-        end = args.end_channels
-        layer = args.layers
-        k = args.subgraph_size
-        dropout = args.dropout
-        dilation_ex = args.dilation_exponential
-        node_dim = args.node_dim
-        prop_alpha = args.propalpha
-        tanh_alpha = args.tanhalpha
+    for q in range(10):
+        gcn_depth = gcn_depths[randrange(len(gcn_depths))]
+        lr = lrs[randrange(len(lrs))]
+        conv = convs[randrange(len(convs))]
+        res = ress[randrange(len(ress))]
+        skip = skips[randrange(len(skips))]
+        end = ends[randrange(len(ends))]
+        layer = layers[randrange(len(layers))]
+        k = ks[randrange(len(ks))]
+        dropout = dropouts[randrange(len(dropouts))]
+        dilation_ex = dilation_exs[randrange(len(dilation_exs))]
+        node_dim = node_dims[randrange(len(node_dims))]
+        prop_alpha = prop_alphas[randrange(len(prop_alphas))]
+        tanh_alpha = tanh_alphas[randrange(len(tanh_alphas))]
 
         # ============================================================
         # Cache Cleaning

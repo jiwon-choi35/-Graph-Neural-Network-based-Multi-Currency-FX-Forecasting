@@ -71,8 +71,8 @@ def build_predefined_adj(columns, graph_file='data/graph.csv'):
     data = np.ones(len(row_indices), dtype=np.float32)
     adj_sp = sp.coo_matrix((data, (row_indices, col_indices)), shape=(n_nodes, n_nodes)).astype(np.float32)
     
-    adj_dense = adj_sp.todense()
-    adj_dense[adj_sp > 1] = 1 # Clip values to 1
+    adj_dense = np.array(adj_sp.todense())
+    np.clip(adj_dense, 0, 1, out=adj_dense)  # Clip values to 1
     
     adj = torch.from_numpy(adj_dense).float()
     print('Adjacency created...')
@@ -129,10 +129,10 @@ class DataLoaderS(object):
 
         self.dat = torch.zeros_like(self.rawdat)
         self.n, self.m = self.dat.shape
-        self.normalize = 2
+        self.normalize = normalize
         
         self.scale = torch.ones(self.m)
-        self.scale = self.scale.to(device)
+        self.shift = torch.zeros(self.m)
 
         self._normalized(normalize)
         self._split(int(train * self.n), int((train + valid) * self.n), self.n)
@@ -148,10 +148,16 @@ class DataLoaderS(object):
         self.adj = build_predefined_adj(self.col) 
         # 만약 그래프 파일 경로가 다르다면 build_predefined_adj(self.col, '경로') 로 수정 필요
 
-        # Calculate metrics using Test set
-        tmp = self.test[1] * self.scale.expand(self.test[1].size(0), self.test[1].size(1), self.m)
+        # Calculate metrics using Test set (CPU에서 수행)
+        scale_exp = self.scale.expand(self.test[1].size(0), self.test[1].size(1), self.m)
+        shift_exp = self.shift.expand(self.test[1].size(0), self.test[1].size(1), self.m)
+        tmp = self.test[1] * scale_exp + shift_exp
         self.rse = normal_std(tmp)
         self.rae = torch.mean(torch.abs(tmp - torch.mean(tmp)))
+
+        # 초기화 완료 후 scale, shift를 GPU로 이동
+        self.scale = self.scale.to(device)
+        self.shift = self.shift.to(device)
 
 
     def _normalized(self, normalize):
@@ -170,7 +176,16 @@ class DataLoaderS(object):
             mask = max_abs_val > 0
             self.dat = self.rawdat.clone()
             # Avoid division by zero
-            self.dat[:, mask] = self.rawdat[:, mask] / max_abs_val[mask]  
+            self.dat[:, mask] = self.rawdat[:, mask] / max_abs_val[mask]
+
+        # z-score normalization: (x - mean) / std
+        if (normalize == 3):
+            col_mean = self.rawdat.mean(dim=0)
+            col_std = self.rawdat.std(dim=0)
+            col_std[col_std == 0] = 1  # avoid division by zero
+            self.scale = col_std
+            self.shift = col_mean
+            self.dat = (self.rawdat - col_mean) / col_std
 
     def _split(self, train, valid, test):
         # util.py Logic: Strictly separates Train / Valid / Test ranges
