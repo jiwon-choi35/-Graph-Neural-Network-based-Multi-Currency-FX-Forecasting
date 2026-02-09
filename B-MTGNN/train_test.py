@@ -566,27 +566,29 @@ parser.add_argument('--normalize', type=int, default=3)
 parser.add_argument('--device', type=str, default='cuda:1', help='')
 parser.add_argument('--gcn_true', type=bool, default=True, help='whether to add graph convolution layer')
 parser.add_argument('--buildA_true', type=bool, default=True, help='whether to construct adaptive adjacency matrix')
-parser.add_argument('--gcn_depth', type=int, default=2, help='graph convolution depth')
+# ===== Best HP: [1, 0.001, 8, 64, 128, 1024, 40, 0.2, 2, 30, 0.6, 0.1, 1, 35] =====
+# Best Results: jp_fx Val 0.611/Test 1.785, kr_fx Val 0.722/Test 1.208, us_TWDI Val 0.833/Test 1.012
+parser.add_argument('--gcn_depth', type=int, default=1, help='graph convolution depth')
 parser.add_argument('--num_nodes', type=int, default=142, help='number of nodes/variables')
 parser.add_argument('--dropout', type=float, default=0.2, help='dropout rate')
-parser.add_argument('--subgraph_size', type=int, default=20, help='k')
-parser.add_argument('--node_dim', type=int, default=40, help='dim of nodes')
+parser.add_argument('--subgraph_size', type=int, default=40, help='k')
+parser.add_argument('--node_dim', type=int, default=30, help='dim of nodes')
 parser.add_argument('--dilation_exponential', type=int, default=2, help='dilation exponential')
 parser.add_argument('--conv_channels', type=int, default=8, help='convolution channels')
-parser.add_argument('--residual_channels', type=int, default=8, help='residual channels')
-parser.add_argument('--skip_channels', type=int, default=16, help='skip channels')
-parser.add_argument('--end_channels', type=int, default=32, help='end channels')
+parser.add_argument('--residual_channels', type=int, default=64, help='residual channels')
+parser.add_argument('--skip_channels', type=int, default=128, help='skip channels')
+parser.add_argument('--end_channels', type=int, default=1024, help='end channels')
 parser.add_argument('--in_dim', type=int, default=1, help='inputs dimension')
 parser.add_argument('--seq_in_len', type=int, default=24, help='input sequence length')
 parser.add_argument('--seq_out_len', type=int, default=1, help='output sequence length')
 parser.add_argument('--horizon', type=int, default=1)
-parser.add_argument('--layers', type=int, default=3, help='number of layers')
+parser.add_argument('--layers', type=int, default=1, help='number of layers')
 parser.add_argument('--batch_size', type=int, default=4, help='batch size')
 parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
 parser.add_argument('--weight_decay', type=float, default=0.00001, help='weight decay rate')
 parser.add_argument('--clip', type=int, default=10, help='clip')
-parser.add_argument('--propalpha', type=float, default=0.05, help='prop alpha')
-parser.add_argument('--tanhalpha', type=float, default=3, help='tanh alpha')
+parser.add_argument('--propalpha', type=float, default=0.6, help='prop alpha')
+parser.add_argument('--tanhalpha', type=float, default=0.1, help='tanh alpha')
 parser.add_argument('--epochs', type=int, default=200, help='')
 parser.add_argument('--num_split', type=int, default=1, help='number of splits for graphs')
 parser.add_argument('--step_size', type=int, default=100, help='step_size')
@@ -616,6 +618,7 @@ fixed_seed = 123
 def main(experiment):
     set_random_seed(fixed_seed)
 
+    # ===== HP ranges for random search (original ranges) =====
     gcn_depths = [1, 2, 3]
     lrs = [0.01, 0.001, 0.0005, 0.0008, 0.0001, 0.0003, 0.005]
     convs = [4, 8, 16]
@@ -641,20 +644,21 @@ def main(experiment):
 
     best_hp = []
 
-    for q in range(10):
-        gcn_depth = gcn_depths[randrange(len(gcn_depths))]
-        lr = lrs[randrange(len(lrs))]
-        conv = convs[randrange(len(convs))]
-        res = ress[randrange(len(ress))]
-        skip = skips[randrange(len(skips))]
-        end = ends[randrange(len(ends))]
-        layer = layers[randrange(len(layers))]
-        k = ks[randrange(len(ks))]
-        dropout = dropouts[randrange(len(dropouts))]
-        dilation_ex = dilation_exs[randrange(len(dilation_exs))]
-        node_dim = node_dims[randrange(len(node_dims))]
-        prop_alpha = prop_alphas[randrange(len(prop_alphas))]
-        tanh_alpha = tanh_alphas[randrange(len(tanh_alphas))]
+    # ===== Fixed HP (best result) - no random search =====
+    for q in range(1):
+        gcn_depth = args.gcn_depth
+        lr = args.lr
+        conv = args.conv_channels
+        res = args.residual_channels
+        skip = args.skip_channels
+        end = args.end_channels
+        layer = args.layers
+        k = args.subgraph_size
+        dropout = args.dropout
+        dilation_ex = args.dilation_exponential
+        node_dim = args.node_dim
+        prop_alpha = args.propalpha
+        tanh_alpha = args.tanhalpha
 
         # ============================================================
         # Cache Cleaning
