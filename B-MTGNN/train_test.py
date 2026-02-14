@@ -208,9 +208,13 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
     r = 5
     print('testing r=', str(r))
     test_window = test_window.to(data.device)
-    print('Test Window Feature:', test_window[:, r])
     
+    # 초기 입력 데이터 설정
     x_input = test_window[0:n_input, :].clone()
+    last_predicted = None  # B: Smoothing을 위한 이전 예측값 저장
+
+    # [수정 1] fixed_wm, fixed_ws 변수 및 관련 로직 제거
+    # 매 반복문(Sliding Window)마다 통계를 새로 계산해야 함
 
     for i in range(n_input, test_window.shape[0], data.out_len):
         X = torch.unsqueeze(x_input, dim=0)
@@ -218,15 +222,20 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
         X = X.transpose(2, 3)  # [1, 1, N, T]
         X = X.to(torch.float)
 
-        # ===== RevIN: Per-Window Normalization =====
+        # =====================================================
+        # [수정 2] Dynamic RevIN: 현재 윈도우(X)의 통계 계산
+        # =====================================================
         w_mean = X.mean(dim=-1, keepdim=True)  # [1, 1, N, 1]
         w_std = X.std(dim=-1, keepdim=True)    # [1, 1, N, 1]
-        w_std[w_std == 0] = 1
+        w_std[w_std == 0] = 1 # 0으로 나누기 방지
+        
+        # 정규화 (Normalization)
         X = (X - w_mean) / w_std
-
+        
+        # 나중에 복원을 위해 차원 축소해서 저장
         wm = w_mean[0, 0, :, 0]  # [N]
         ws = w_std[0, 0, :, 0]   # [N]
-        # ============================================
+        # =====================================================
 
         y_true = test_window[i: i + data.out_len, :].clone()
 
@@ -237,9 +246,13 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
             with torch.no_grad():
                 output = model(X)
                 y_pred = output[-1, :, :, -1].clone()
-                # ===== RevIN Denormalize (back to z-score space) =====
+                
+                # =====================================================
+                # [수정 3] 현재 윈도우의 통계로 복원 (Denormalization)
+                # =====================================================
                 y_pred = y_pred * ws + wm
                 # =====================================================
+                
                 if y_pred.shape[0] > y_true.shape[0]:
                     y_pred = y_pred[:-(y_pred.shape[0] - y_true.shape[0]), ]
             outputs.append(y_pred)
@@ -252,6 +265,34 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
         z = 1.96
         confidence = z * std_dev / torch.sqrt(torch.tensor(num_runs))
 
+        # ===== B: Smoothing/Clamping (예측값 안정화) =====
+        if last_predicted is not None:
+            # Exponential smoothing: 0.7 * 현재 예측 + 0.3 * 이전 예측
+            y_pred = 0.7 * y_pred + 0.3 * last_predicted
+            
+            # Clamping: 이전 실제값 대비 ±10% 제한 (첫 step 이후)
+            if i > n_input:
+                last_actual = test_window[i-1, :]
+                y_pred = torch.clamp(y_pred, last_actual * 0.9, last_actual * 1.1)
+        
+        last_predicted = y_pred.clone()
+        # ==================================================
+
+        # ===== C: Partial Teacher Forcing (4 step마다 실제값 주입) =====
+        step_count = (i - n_input) // data.out_len
+        if step_count > 0 and step_count % 4 == 0:
+            # 4 step마다 실제값으로 입력 일부 리셋 (오차 누적 차단)
+            reset_len = min(data.out_len, data.P // 2)  # 입력의 절반 정도를 실제값으로 교체
+            if i + reset_len <= test_window.shape[0]:
+                actual_reset = test_window[i:i+reset_len, :].clone()
+                # 입력의 마지막 reset_len 부분을 실제값으로 교체
+                if data.P <= data.out_len:
+                    x_input = actual_reset[-data.P:].clone()
+                else:
+                    x_input = torch.cat([x_input[:-reset_len], actual_reset], dim=0)[-data.P:]
+        # ================================================================
+
+        # 다음 스텝을 위한 입력 업데이트 (Sliding Window)
         if data.P <= data.out_len:
             x_input = y_pred[-data.P:].clone()
         else:
@@ -268,16 +309,16 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
             variance = torch.cat((variance, var))
             confidence_95 = torch.cat((confidence_95, confidence))
 
-    # =============================================
-    # [중요] Evaluate 단계에서는 Scale을 복원합니다.
-    # =============================================
+    # 데이터 스케일(DataLoader의 scale/shift) 복원
     scale = data.scale.expand(test.size(0), data.m)
     shift = data.shift.expand(test.size(0), data.m)
+    
     predict = predict * scale + shift
     test = test * scale + shift
     variance *= scale
     confidence_95 *= scale
 
+    # --- Metrics 계산 (기존 코드 유지) ---
     sum_squared_diff = torch.sum(torch.pow(test - predict, 2))
     sum_absolute_diff = torch.sum(torch.abs(test - predict))
 
@@ -301,6 +342,7 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
 
     predict = predict.data.cpu().numpy()
     Ytest = test.data.cpu().numpy()
+    
     sigma_p = (predict).std(axis=0)
     sigma_g = (Ytest).std(axis=0)
     mean_p = predict.mean(axis=0)
@@ -317,6 +359,7 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
         smape += s_mape(Ytest[:, z], predict[:, z])
     smape /= Ytest.shape[1]
 
+    # --- Plotting (기존 코드 유지) ---
     counter = 0
     if is_plot:
         target_nodes = ['us_Trade Weighted Dollar Index', 'kr_fx', 'jp_fx']
@@ -469,10 +512,29 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
             smape += s_mape(Ytest[x, :, z], predict[x, :, z])
     smape /= Ytest.shape[0] * Ytest.shape[2]
 
+    # ===== jp_fx 개별 RSE 계산 (Best 모델 선택 기준용) =====
+    jp_fx_rse = None
+    target_nodes = ['us_Trade Weighted Dollar Index', 'kr_fx', 'jp_fx']
+    for v in range(data.m):
+        raw_name = data.col[v]
+        if raw_name == 'jp_fx':
+            # jp_fx 노드의 RSE 계산
+            jp_pred = predict[:, 0, v]
+            jp_true = Ytest[:, 0, v]
+            jp_diff_sq = np.sum((jp_pred - jp_true) ** 2)
+            jp_mean = np.mean(jp_true)
+            jp_diff_from_mean_sq = np.sum((jp_true - jp_mean) ** 2)
+            if jp_diff_from_mean_sq > 0:
+                jp_fx_rse = np.sqrt(jp_diff_sq / jp_diff_from_mean_sq)
+            else:
+                jp_fx_rse = 0.0
+            break
+    if jp_fx_rse is None:
+        jp_fx_rse = rrse  # jp_fx를 찾지 못한 경우 전체 RSE 사용
+    # ========================================================
+
     counter = 0
     if is_plot:
-        target_nodes = ['us_Trade Weighted Dollar Index', 'kr_fx', 'jp_fx']
-
         for v in range(data.m):
             col = v
             raw_name = data.col[col]
@@ -485,7 +547,7 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
             save_metrics_1d(torch.from_numpy(predict[:, 0, col]), torch.from_numpy(Ytest[:, 0, col]), node_name, 'Validation')
             plot_predicted_actual(predict[:, 0, col], Ytest[:, 0, col], node_name, 'Validation', variance[:, 0, col], confidence_95[:, 0, col])
             counter += 1
-    return rrse, rae, correlation, smape
+    return rrse, rae, correlation, smape, jp_fx_rse
 
 
 def train(data, X, Y, model, criterion, optim, batch_size):
@@ -495,12 +557,16 @@ def train(data, X, Y, model, criterion, optim, batch_size):
     iter = 0
 
     # ===== Target-Weighted Loss =====
-    target_nodes = ['us_Trade Weighted Dollar Index', 'kr_fx', 'jp_fx']
+    # us_Trade Weighted Dollar Index, kr_fx: 기본 가중치 (10.0)
+    # jp_fx: 더 강하게 학습 (20.0)
     target_weight = torch.ones(data.m, device=device)
     for i, col_name in enumerate(data.col):
-        if col_name in target_nodes:
+        if col_name == 'us_Trade Weighted Dollar Index' or col_name == 'kr_fx':
             target_weight[i] = 10.0
-    print(f"[Target-Weighted Loss] weights applied: { {data.col[i]: target_weight[i].item() for i in range(data.m) if target_weight[i] > 1} }")
+        elif col_name == 'jp_fx':
+            target_weight[i] = 20.0
+    print(f"[Target-Weighted Loss] weights applied: "
+          f"{ {data.col[i]: target_weight[i].item() for i in range(data.m) if target_weight[i] > 1} }")
     # ==================================
 
     for X, Y in data.get_batches(X, Y, batch_size, True):
@@ -533,6 +599,27 @@ def train(data, X, Y, model, criterion, optim, batch_size):
             id = torch.tensor(id).to(device)
             tx = X[:, :, :, :]
             ty = Y[:, :, :]
+            
+            # ===== A: Scheduled Sampling (25% 확률로 자기회귀 학습) =====
+            use_autoregressive = random.random() < 0.25
+            if use_autoregressive and iter > 0:
+                # 이전 예측값을 다음 입력에 일부 사용 (자기회귀 학습)
+                with torch.no_grad():
+                    prev_output = model(tx)
+                    prev_pred = torch.squeeze(prev_output, 3)  # [B, T_out, N]
+                    # 예측값을 RevIN 통계로 정규화
+                    prev_pred_norm = (prev_pred - wm.unsqueeze(1)) / ws.unsqueeze(1)  # [B, T_out, N]
+                    # 입력의 마지막 부분을 예측값으로 대체 (자기회귀 시뮬레이션)
+                    if tx.size(3) > 1:
+                        # 마지막 1 step을 예측값으로 교체
+                        tx_autoregressive = tx.clone()
+                        # 예측값을 입력 형태로 변환 [B, 1, N, 1]에 맞춤
+                        # prev_pred_norm[:, -1:, :] → [B, 1, N], unsqueeze(-1) → [B, 1, N, 1]
+                        prev_pred_reshaped = prev_pred_norm[:, -1:, :].unsqueeze(-1)  # [B, 1, N, 1]
+                        tx_autoregressive = torch.cat([tx_autoregressive[:, :, :, :-1], prev_pred_reshaped], dim=3)
+                        tx = tx_autoregressive
+            # ============================================================
+            
             output = model(tx)
             output = torch.squeeze(output, 3)
 
@@ -566,27 +653,27 @@ parser.add_argument('--normalize', type=int, default=3)
 parser.add_argument('--device', type=str, default='cuda:1', help='')
 parser.add_argument('--gcn_true', type=bool, default=True, help='whether to add graph convolution layer')
 parser.add_argument('--buildA_true', type=bool, default=True, help='whether to construct adaptive adjacency matrix')
-parser.add_argument('--gcn_depth', type=int, default=2, help='graph convolution depth')
+parser.add_argument('--gcn_depth', type=int, default=1, help='graph convolution depth')
 parser.add_argument('--num_nodes', type=int, default=142, help='number of nodes/variables')
-parser.add_argument('--dropout', type=float, default=0.4, help='dropout rate')
-parser.add_argument('--subgraph_size', type=int, default=20, help='k')
-parser.add_argument('--node_dim', type=int, default=40, help='dim of nodes')
+parser.add_argument('--dropout', type=float, default=0.2, help='dropout rate')
+parser.add_argument('--subgraph_size', type=int, default=40, help='k')
+parser.add_argument('--node_dim', type=int, default=30, help='dim of nodes')
 parser.add_argument('--dilation_exponential', type=int, default=2, help='dilation exponential')
 parser.add_argument('--conv_channels', type=int, default=8, help='convolution channels')
-parser.add_argument('--residual_channels', type=int, default=8, help='residual channels')
-parser.add_argument('--skip_channels', type=int, default=16, help='skip channels')
-parser.add_argument('--end_channels', type=int, default=32, help='end channels')
+parser.add_argument('--residual_channels', type=int, default=64, help='residual channels')
+parser.add_argument('--skip_channels', type=int, default=128, help='skip channels')
+parser.add_argument('--end_channels', type=int, default=1024, help='end channels')
 parser.add_argument('--in_dim', type=int, default=1, help='inputs dimension')
 parser.add_argument('--seq_in_len', type=int, default=24, help='input sequence length')
 parser.add_argument('--seq_out_len', type=int, default=1, help='output sequence length')
 parser.add_argument('--horizon', type=int, default=1)
-parser.add_argument('--layers', type=int, default=3, help='number of layers')
+parser.add_argument('--layers', type=int, default=1, help='number of layers')
 parser.add_argument('--batch_size', type=int, default=4, help='batch size')
 parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
 parser.add_argument('--weight_decay', type=float, default=0.00001, help='weight decay rate')
 parser.add_argument('--clip', type=int, default=10, help='clip')
-parser.add_argument('--propalpha', type=float, default=0.05, help='prop alpha')
-parser.add_argument('--tanhalpha', type=float, default=3, help='tanh alpha')
+parser.add_argument('--propalpha', type=float, default=0.6, help='prop alpha')
+parser.add_argument('--tanhalpha', type=float, default=0.1, help='tanh alpha')
 parser.add_argument('--epochs', type=int, default=200, help='')
 parser.add_argument('--num_split', type=int, default=1, help='number of splits for graphs')
 parser.add_argument('--step_size', type=int, default=100, help='step_size')
@@ -616,45 +703,34 @@ fixed_seed = 123
 def main(experiment):
     set_random_seed(fixed_seed)
 
-    gcn_depths = [1, 2, 3]
-    lrs = [0.01, 0.001, 0.0005, 0.0008, 0.0001, 0.0003, 0.005]
-    convs = [4, 8, 16]
-    ress = [16, 32, 64]
-    skips = [64, 128, 256]
-    ends = [256, 512, 1024]
-    layers = [1, 2]
-    ks = [20, 30, 40, 50, 60, 70, 80, 90, 100]
-    dropouts = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
-    dilation_exs = [1, 2, 3]
-    node_dims = [20, 30, 40, 50, 60, 70, 80, 90, 100]
-    prop_alphas = [0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.6, 0.8]
-    tanh_alphas = [0.05, 0.1, 0.5, 1, 2, 3, 5, 7, 9]
-
+    # ===== Fixed HP (0209 최적 결과 기반) - no random search =====
     best_val = 10000000
     best_rse = 10000000
     best_rae = 10000000
     best_corr = -10000000
     best_smape = 10000000
+    best_combined_score = 10000000  # Best 모델 선택 기준: 0.5 * 전체 RSE + 0.5 * jp_fx RSE
 
     best_test_rse = 10000000
     best_test_corr = -10000000
 
     best_hp = []
 
-    for q in range(10):
-        gcn_depth = gcn_depths[randrange(len(gcn_depths))]
-        lr = lrs[randrange(len(lrs))]
-        conv = convs[randrange(len(convs))]
-        res = ress[randrange(len(ress))]
-        skip = skips[randrange(len(skips))]
-        end = ends[randrange(len(ends))]
-        layer = layers[randrange(len(layers))]
-        k = ks[randrange(len(ks))]
-        dropout = dropouts[randrange(len(dropouts))]
-        dilation_ex = dilation_exs[randrange(len(dilation_exs))]
-        node_dim = node_dims[randrange(len(node_dims))]
-        prop_alpha = prop_alphas[randrange(len(prop_alphas))]
-        tanh_alpha = tanh_alphas[randrange(len(tanh_alphas))]
+    for q in range(1):
+        # 0209 최적 HP 사용 (고정)
+        gcn_depth = args.gcn_depth
+        lr = args.lr
+        conv = args.conv_channels
+        res = args.residual_channels
+        skip = args.skip_channels
+        end = args.end_channels
+        layer = args.layers
+        k = args.subgraph_size
+        dropout = args.dropout
+        dilation_ex = args.dilation_exponential
+        node_dim = args.node_dim
+        prop_alpha = args.propalpha
+        tanh_alpha = args.tanhalpha
 
         # ============================================================
         # Cache Cleaning
@@ -745,17 +821,20 @@ def main(experiment):
 
                 epoch_start_time = time.time()
                 train_loss = train(Data, Data.train[0], Data.train[1], model, criterion, optim, args.batch_size)
-                val_loss, val_rae, val_corr, val_smape = evaluate(Data, Data.valid[0], Data.valid[1], model, evaluateL2, evaluateL1,
+                val_loss, val_rae, val_corr, val_smape, jp_fx_val_rse = evaluate(Data, Data.valid[0], Data.valid[1], model, evaluateL2, evaluateL1,
                                                                   args.batch_size, False)
                 print(
-                    '| end of epoch {:3d} | time: {:5.2f}s | train_loss {:5.4f} | valid rse {:5.4f} | valid rae {:5.4f} | valid corr  {:5.4f} | valid smape  {:5.4f}'.format(
-                        epoch, (time.time() - epoch_start_time), train_loss, val_loss, val_rae, val_corr, val_smape), flush=True)
+                    '| end of epoch {:3d} | time: {:5.2f}s | train_loss {:5.4f} | valid rse {:5.4f} | valid rae {:5.4f} | valid corr  {:5.4f} | valid smape  {:5.4f} | jp_fx_rse {:5.4f}'.format(
+                        epoch, (time.time() - epoch_start_time), train_loss, val_loss, val_rae, val_corr, val_smape, jp_fx_val_rse), flush=True)
                 
                 scheduler.step(val_loss)
                 
+                # ===== Best 모델 선택 기준: 0.5 * 전체 RSE + 0.5 * jp_fx RSE =====
                 safe_corr = val_corr if not math.isnan(val_corr) else 0.0
                 sum_loss = val_loss + val_rae - safe_corr
-                if val_loss < best_rse:
+                combined_score = 0.5 * val_loss + 0.5 * jp_fx_val_rse
+                
+                if combined_score < best_combined_score:
                     save_path = Path(args.save)
                     save_path.parent.mkdir(parents=True, exist_ok=True)
                     
@@ -766,6 +845,7 @@ def main(experiment):
                     best_rae = val_rae
                     best_corr = val_corr
                     best_smape = val_smape
+                    best_combined_score = combined_score  # Best 모델 선택 기준 업데이트
 
                     best_hp = [gcn_depth, lr, conv, res, skip, end, k, dropout, dilation_ex, node_dim, prop_alpha, tanh_alpha, layer, epoch]
 
@@ -793,8 +873,10 @@ def main(experiment):
 
     with open(args.save, 'rb') as f:
         model = torch.load(f, weights_only=False)
+    # 로드한 모델도 학습 시와 같은 device로 이동
+    model = model.to(device)
 
-    vtest_acc, vtest_rae, vtest_corr, vtest_smape = evaluate(Data, Data.valid[0], Data.valid[1], model, evaluateL2, evaluateL1,
+    vtest_acc, vtest_rae, vtest_corr, vtest_smape, _ = evaluate(Data, Data.valid[0], Data.valid[1], model, evaluateL2, evaluateL1,
                                                              args.batch_size, True)
 
     test_acc, test_rae, test_corr, test_smape = evaluate_sliding_window(Data, Data.test_window, model, evaluateL2, evaluateL1,

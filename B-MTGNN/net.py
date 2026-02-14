@@ -101,14 +101,12 @@ class gtnet(nn.Module):
         if self.seq_length<self.receptive_field:
             input = nn.functional.pad(input,(self.receptive_field-self.seq_length,0,0,0))
 
-
+        # load 후 model.to(device) 시 self.idx는 자동 이동 안 되므로, forward에서 입력과 동일 device로
+        run_idx = (self.idx if idx is None else idx).to(input.device)
 
         if self.gcn_true:
             if self.buildA_true:
-                if idx is None:
-                    adp = self.gc(self.idx) # this line computes the adjacency matrix adaptively by calling the function forward in the gc
-                else:
-                    adp = self.gc(idx)
+                adp = self.gc(run_idx)
             else:
                 adp = self.predefined_A
         
@@ -153,10 +151,7 @@ class gtnet(nn.Module):
                 x = self.residual_convs[i](x)
 
             x = x + residual[:, :, :, -x.size(3):]
-            if idx is None:
-                x = self.norm[i](x,self.idx)
-            else:
-                x = self.norm[i](x,idx)
+            x = self.norm[i](x, run_idx)
 
         skip = self.skipE(x) + skip
         x = F.relu(skip)
