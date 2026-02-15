@@ -278,20 +278,6 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
         last_predicted = y_pred.clone()
         # ==================================================
 
-        # ===== C: Partial Teacher Forcing (4 step마다 실제값 주입) =====
-        step_count = (i - n_input) // data.out_len
-        if step_count > 0 and step_count % 4 == 0:
-            # 4 step마다 실제값으로 입력 일부 리셋 (오차 누적 차단)
-            reset_len = min(data.out_len, data.P // 2)  # 입력의 절반 정도를 실제값으로 교체
-            if i + reset_len <= test_window.shape[0]:
-                actual_reset = test_window[i:i+reset_len, :].clone()
-                # 입력의 마지막 reset_len 부분을 실제값으로 교체
-                if data.P <= data.out_len:
-                    x_input = actual_reset[-data.P:].clone()
-                else:
-                    x_input = torch.cat([x_input[:-reset_len], actual_reset], dim=0)[-data.P:]
-        # ================================================================
-
         # 다음 스텝을 위한 입력 업데이트 (Sliding Window)
         if data.P <= data.out_len:
             x_input = y_pred[-data.P:].clone()
