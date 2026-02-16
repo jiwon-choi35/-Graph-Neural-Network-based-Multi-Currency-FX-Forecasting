@@ -6,6 +6,7 @@ import torch
 from scipy.sparse import linalg
 import csv
 from collections import defaultdict
+from pathlib import Path
 import pandas as pd 
 
 def create_columns(file_path):
@@ -24,21 +25,28 @@ def create_columns(file_path):
         except StopIteration:
             return []
 
-def build_predefined_adj(columns, graph_file='data/graph.csv'):
-    # Initialize an empty dictionary
-    graph = defaultdict(list)
+def build_predefined_adj(columns, graph_file='data/graph.csv', exclude_nodes=None):
+    # 회의 결정: graph에서 중국·영국 제외 (노드 이름에 포함되면 엣지에 사용 안 함)
+    if exclude_nodes is None:
+        exclude_nodes = ('china', 'uk', '영국', '중국', 'cn_', 'uk_')  # 소문자 비교용
+    def _excluded(name):
+        if not name:
+            return True
+        n = str(name).strip().lower()
+        return any(n.startswith(e.lower()) or e.lower() in n for e in exclude_nodes if e)
 
-    # Read the graph CSV file
+    graph = defaultdict(list)
     try:
         with open(graph_file, 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
             for row in reader:
                 if not row: continue
                 key_node = row[0]
-                # Extract adjacent nodes (skipping empty strings)
-                adjacent_nodes = [node for node in row[1:] if node]
+                if _excluded(key_node):
+                    continue
+                adjacent_nodes = [node for node in row[1:] if node and not _excluded(node)]
                 graph[key_node].extend(adjacent_nodes)
-        print('Graph loaded with', len(graph), 'attacks...')
+        print('Graph loaded with', len(graph), 'attacks (China/UK excluded per meeting).')
     except FileNotFoundError:
         print(f"Warning: Graph file not found at {graph_file}. Returning zero matrix.")
         return torch.zeros((len(columns), len(columns)))
@@ -66,6 +74,13 @@ def build_predefined_adj(columns, graph_file='data/graph.csv'):
 
     if not row_indices:
         print("No edges found in the graph.")
+        # 데이터 CSV 헤더와 graph.csv 노드명이 완전히 일치해야 함 (공백·대소문자 포함)
+        in_data_not_graph = [c for c in columns if c not in graph and not _excluded(c)]
+        in_graph_not_data = [k for k in graph.keys() if k not in col_to_idx]
+        if in_data_not_graph:
+            print("  Hint: columns in data but not in graph (first 5):", in_data_not_graph[:5])
+        if in_graph_not_data:
+            print("  Hint: nodes in graph but not in data (first 5):", in_graph_not_data[:5])
         return torch.zeros(n_nodes, n_nodes)
     
     data = np.ones(len(row_indices), dtype=np.float32)
@@ -82,7 +97,10 @@ def build_predefined_adj(columns, graph_file='data/graph.csv'):
 def normal_std(x):
     if isinstance(x, torch.Tensor):
         x = x.numpy()
-    return x.std() * np.sqrt((len(x) - 1.)/(len(x)))
+    n = len(x) if x.ndim >= 1 else 0
+    if n == 0:
+        return 1.0  # 테스트 샘플 0개 시 division by zero 방지
+    return x.std() * np.sqrt((n - 1.) / n)
 
 
 class DataLoaderS(object):
@@ -97,16 +115,16 @@ class DataLoaderS(object):
             print(f"Loading data from {file_name}...")
             df = pd.read_csv(file_name)
             
+            # 날짜 기준 분할용: Date 컬럼 보존 후 파싱
+            date_series = None
             if 'Date' in df.columns:
+                date_series = df['Date'].copy()
                 df = df.drop(columns=['Date'])
             elif df.columns[0].lower() == 'date':
+                date_series = df.iloc[:, 0].copy()
                 df = df.iloc[:, 1:]
 
             df = df.apply(pd.to_numeric, errors='coerce')
-
-            # 과거 데이터의 작은 구멍은 앞의 값으로 채워줌
-            # df = df.fillna(method='ffill', limit=5)
-
             df = df.fillna(0)
             self.rawdat_np = df.values.astype(float)
             print("Data loaded and converted to numeric successfully.")
@@ -117,6 +135,7 @@ class DataLoaderS(object):
                 self.rawdat_np = np.loadtxt(file_name, delimiter=',', skiprows=1)
             except Exception as e2:
                 raise ValueError(f"Failed to load data: {e2}")
+            date_series = None
 
         self.rawdat = torch.from_numpy(self.rawdat_np).float()
 
@@ -135,7 +154,9 @@ class DataLoaderS(object):
         self.shift = torch.zeros(self.m)
 
         self._normalized(normalize)
-        self._split(int(train * self.n), int((train + valid) * self.n), self.n)
+        # 회의 결정: valid=24년 1~12월, test=25년 1~12월 → 날짜 기준 분할 사용 시
+        train_end, valid_end = self._resolve_split_indices(train, valid, date_series)
+        self._split(train_end, valid_end, self.n)
 
         target_col_file = col_file if col_file else file_name
         try:
@@ -145,20 +166,62 @@ class DataLoaderS(object):
         except:
              self.col = [str(i) for i in range(self.m)]
 
-        self.adj = build_predefined_adj(self.col) 
-        # 만약 그래프 파일 경로가 다르다면 build_predefined_adj(self.col, '경로') 로 수정 필요
+        # 그래프 경로: 데이터 파일과 같은 폴더의 graph.csv, 없으면 (데이터파일 부모)/data/graph.csv
+        data_path = Path(file_name).resolve()
+        same_dir_graph = data_path.parent / 'graph.csv'
+        data_subdir_graph = data_path.parent / 'data' / 'graph.csv'
+        if same_dir_graph.exists():
+            graph_file = str(same_dir_graph)
+        elif data_subdir_graph.exists():
+            graph_file = str(data_subdir_graph)
+        else:
+            graph_file = 'data/graph.csv'
+        self.adj = build_predefined_adj(self.col, graph_file=graph_file)
 
         # Calculate metrics using Test set (CPU에서 수행)
-        scale_exp = self.scale.expand(self.test[1].size(0), self.test[1].size(1), self.m)
-        shift_exp = self.shift.expand(self.test[1].size(0), self.test[1].size(1), self.m)
-        tmp = self.test[1] * scale_exp + shift_exp
-        self.rse = normal_std(tmp)
-        self.rae = torch.mean(torch.abs(tmp - torch.mean(tmp)))
+        n_test = self.test[1].size(0)
+        if n_test == 0:
+            # test 배치 0개 (예: 날짜 기준 test=12개월 + seq_out_len=12 → _batchify에서 0개)
+            self.rse = 1.0
+            self.rae = 1.0
+        else:
+            scale_exp = self.scale.expand(n_test, self.test[1].size(1), self.m)
+            shift_exp = self.shift.expand(n_test, self.test[1].size(1), self.m)
+            tmp = self.test[1] * scale_exp + shift_exp
+            self.rse = normal_std(tmp)
+            self.rae = torch.mean(torch.abs(tmp - torch.mean(tmp)))
 
         # 초기화 완료 후 scale, shift를 GPU로 이동
         self.scale = self.scale.to(device)
         self.shift = self.shift.to(device)
 
+
+    def _resolve_split_indices(self, train_ratio, valid_ratio, date_series):
+        """회의 결정: valid=24년 1~12월, test=25년 1~12월. Date 있으면 날짜 기준, 없으면 비율.
+        train_ratio=1.0, valid_ratio=0.0 이면 전체를 train으로 사용 (원본 train.py 전체 데이터 학습용)."""
+        if train_ratio >= 1.0 or (train_ratio + valid_ratio) >= 1.0:
+            print("Full-data mode: using 100% of data for training (no valid/test split).")
+            return self.n, self.n
+        if date_series is None or len(date_series) != self.n:
+            return int(train_ratio * self.n), int((train_ratio + valid_ratio) * self.n)
+        try:
+            # "2011-01", "2024-12" 형태 파싱
+            parts = date_series.astype(str).str.strip().str.split('-', expand=True)
+            if parts.shape[1] < 2:
+                return int(train_ratio * self.n), int((train_ratio + valid_ratio) * self.n)
+            years = parts[0].astype(int).to_numpy()
+            months = parts[1].astype(int).to_numpy()
+            mask_2024_01 = (years == 2024) & (months == 1)
+            mask_2025_01 = (years == 2025) & (months == 1)
+            if mask_2024_01.any() and mask_2025_01.any():
+                valid_start = int(np.where(mask_2024_01)[0][0])
+                test_start = int(np.where(mask_2025_01)[0][0])
+                if valid_start < test_start:
+                    print(f"Date-based split: valid 2024-01~12 (rows {valid_start}~{test_start-1}), test 2025-01~12 (rows {test_start}~{self.n-1})")
+                    return valid_start, test_start
+        except Exception as e:
+            print(f"Date-based split failed ({e}), using ratio.")
+        return int(train_ratio * self.n), int((train_ratio + valid_ratio) * self.n)
 
     def _normalized(self, normalize):
         if (normalize == 0):
@@ -195,9 +258,11 @@ class DataLoaderS(object):
         
         self.train = self._batchify(train_set, self.h)
         self.valid = self._batchify(valid_set, self.h)
-        self.test =  self._batchify(test_set, self.h)
-        
-        self.test_window = self.dat[-(36+self.P):, :].clone()
+        self.test = self._batchify(test_set, self.h)
+
+        num_test_points = len(test_set)
+        test_window_len = num_test_points + self.P
+        self.test_window = self.dat[-test_window_len:, :].clone()
 
     def _batchify(self, idx_set, horizon):
         n = len(idx_set) 
