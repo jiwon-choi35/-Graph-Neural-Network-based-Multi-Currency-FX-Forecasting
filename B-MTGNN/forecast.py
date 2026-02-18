@@ -175,7 +175,8 @@ def plot_multi_node(dates_hist, dates_future, smoothed_hist, smoothed_fut, smoot
     if x_start is None:
         x_start = dates_hist[0]
     if x_end is None:
-        x_end = dates_future[-1] + pd.Timedelta(days=30)
+        # 마지막 틱(2026/Dec)이 그래프 맨 끝에 오도록, 최소한의 여유만 둠
+        x_end = dates_future[-1] + pd.Timedelta(days=15)
     ax.set_xlim(pd.Timestamp(x_start), pd.Timestamp(x_end))
 
     ax.xaxis.set_major_locator(mdates.YearLocator(1))
@@ -185,12 +186,17 @@ def plot_multi_node(dates_hist, dates_future, smoothed_hist, smoothed_fut, smoot
         end_tick = pd.Timestamp(dates_future[-1])
         year_ticks = pd.date_range(pd.Timestamp(x_start).normalize(), end_tick.normalize(), freq="YS")
         ticks = list(year_ticks)
+        labels = [t.strftime('%Y') for t in year_ticks]
 
+        # 마지막 틱 추가
         if end_tick not in ticks:
             ticks.append(end_tick)
-
-        labels = [t.strftime('%Y') for t in year_ticks]
-        if ticks[-1] == end_tick and (len(labels) == len(ticks) - 1):
+            # 마지막 틱이 연말이고, 같은 연도의 연초 틱이 있으면 연초 틱 제거 (공백 방지)
+            end_year = end_tick.year
+            if len(year_ticks) > 0 and year_ticks[-1].year == end_year:
+                # 같은 연도의 연초 틱과 라벨 제거
+                ticks = [t for t in ticks[:-1] if t.year != end_year] + [end_tick]
+                labels = [l for i, l in enumerate(labels) if year_ticks[i].year != end_year]
             labels.append(end_tick.strftime('%Y/%b'))
 
         ax.set_xticks(ticks)
@@ -207,16 +213,21 @@ def plot_multi_node(dates_hist, dates_future, smoothed_hist, smoothed_fut, smoot
 # Main Execution Block
 # ==========================================
 
-# 경로 설정
+# 경로 설정 (train.py와 동일: 스크립트 위치 = 프로젝트 루트)
 script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(script_dir)
-data_file = os.path.join(script_dir, 'ExchangeRate_DATA.csv')
-model_file = os.path.join(project_root, 'AXIS', 'model', 'Bayesian', 'model.pt')
+# train_test/train과 동일: data/data.csv 우선
+data_file = os.path.join(script_dir, 'data', 'data.csv')
+if not os.path.exists(data_file):
+    data_file = os.path.join(script_dir, 'ExchangeRate_dataset.csv')
+# 원본 README: 운용 모델 o_model.pt로 미래 예측. 없으면 model.pt 사용
+model_file = os.path.join(script_dir, 'model', 'Bayesian', 'o_model.pt')
+if not os.path.exists(model_file):
+    model_file = os.path.join(script_dir, 'model', 'Bayesian', 'model.pt')
 
 # 출력 디렉토리
-plot_dir = os.path.join(project_root, 'AXIS', 'model', 'Bayesian', 'forecast', 'plots')
-pt_plots_dir = os.path.join(project_root, 'AXIS', 'model', 'Bayesian', 'forecast', 'pt_plots')
-data_out_dir = os.path.join(project_root, 'AXIS', 'model', 'Bayesian', 'forecast', 'data')
+plot_dir = os.path.join(script_dir, 'model', 'Bayesian', 'forecast', 'plots')
+pt_plots_dir = os.path.join(script_dir, 'model', 'Bayesian', 'forecast', 'pt_plots')
+data_out_dir = os.path.join(script_dir, 'model', 'Bayesian', 'forecast', 'data')
 
 for d in [plot_dir, pt_plots_dir, data_out_dir]:
     if not os.path.exists(d): 
@@ -247,8 +258,9 @@ try:
     df = df.apply(pd.to_numeric, errors="coerce").ffill().fillna(0)
 
     # 날짜 설정
+    # 규칙 4: forecast 예측기간은 26년 1월~12월이므로, 마지막 관측은 25년 12월
     if dates_all is None:
-        LAST_OBS = pd.Timestamp("2025-07-01")
+        LAST_OBS = pd.Timestamp("2025-12-01")
         dates_all = pd.date_range(end=LAST_OBS, periods=len(df), freq="MS").tolist()
     else:
         dates_all = pd.Series(dates_all).ffill()
@@ -270,8 +282,7 @@ if index_idx != -1:
     print(f"Found Index column at index {index_idx}: {col[index_idx]}")
 
 # ==============================================================================
-# [수정] 5. Normalization: Standardization (Mode 2) 적용
-# 훈련 시 normalize=2를 썼으므로, 여기서도 평균과 표준편차를 사용해야 합니다.
+# 5. Normalization: Z-score (train.py normalize=3과 동일)
 # ==============================================================================
 mean_vals = np.mean(rawdat, axis=0)
 std_vals = np.std(rawdat, axis=0)
@@ -306,36 +317,63 @@ if seq_len is None:
 
 print(f"Using input sequence length (seq_len) = {seq_len}")
 
-# 초기 입력 준비
+# 초기 입력 준비 (전역 Z-score 정규화된 데이터)
 X_init = torch.from_numpy(dat[-seq_len:, :]).float().to(device)
 
 # Bayesian Estimation (Dropout MC)
-num_runs, horizon = 20, 36
+# 규칙 4: forecast 예측기간은 26년 1월~12월 (1년 = 12개월)
+num_runs, horizon = 20, 12
 outputs = []
 
 print(f"Running Bayesian Forecast ({num_runs} MC runs, {horizon} month horizon)...")
+print(f"[RevIN] Applying Reversible Instance Normalization per window (matching training)")
 
 P = seq_len
 
 model.train()
 with torch.no_grad():
-    tmp_in = X_init.unsqueeze(0).unsqueeze(0).permute(0, 1, 3, 2).contiguous()
-    tmp_out = model(tmp_in)
+    # Test shape with RevIN
+    tmp_in = X_init.unsqueeze(0).unsqueeze(0).permute(0, 1, 3, 2).contiguous()  # [1, 1, N, T]
+    # RevIN: Per-Window Normalization
+    w_mean = tmp_in.mean(dim=-1, keepdim=True)  # [1, 1, N, 1]
+    w_std = tmp_in.std(dim=-1, keepdim=True)    # [1, 1, N, 1]
+    w_std[w_std == 0] = 1
+    tmp_in_norm = (tmp_in - w_mean) / w_std
+    tmp_out = model(tmp_in_norm)
     pred_len = int(tmp_out.size(1))
 
 for r in range(num_runs):
-    curr_X = X_init.clone()
+    curr_X = X_init.clone()  # 전역 Z-score 정규화된 데이터
     preds = []
     len_preds = 0
 
     model.train()
     with torch.no_grad():
         while len_preds < horizon:
-            curr_input = curr_X.unsqueeze(0).unsqueeze(0).permute(0, 1, 3, 2).contiguous()
-            out = model(curr_input)
-
-            pred_block = out.squeeze(3).squeeze(0)
-            pred_level = pred_block
+            # 입력 준비: [1, 1, N, T] 형태로 변환
+            curr_input = curr_X.unsqueeze(0).unsqueeze(0).permute(0, 1, 3, 2).contiguous()  # [1, 1, N, T]
+            
+            # ===== RevIN: Per-Window Normalization (학습 시와 동일) =====
+            w_mean = curr_input.mean(dim=-1, keepdim=True)  # [1, 1, N, 1]
+            w_std = curr_input.std(dim=-1, keepdim=True)    # [1, 1, N, 1]
+            w_std[w_std == 0] = 1
+            curr_input_norm = (curr_input - w_mean) / w_std
+            
+            # 나중에 역정규화를 위해 통계 저장
+            wm = w_mean[0, 0, :, 0]  # [N]
+            ws = w_std[0, 0, :, 0]   # [N]
+            # ============================================================
+            
+            # 모델 예측 (RevIN 정규화된 입력 사용)
+            out = model(curr_input_norm)
+            
+            # 출력 형태 변환
+            pred_block = out.squeeze(3).squeeze(0)  # [T_out, N]
+            
+            # ===== RevIN 역정규화 =====
+            # pred_block의 각 시간 단계에 대해 역정규화
+            pred_level = pred_block * ws.unsqueeze(0) + wm.unsqueeze(0)  # [T_out, N]
+            # ===========================
 
             need = horizon - len_preds
             take = min(pred_level.size(0), need)
@@ -344,6 +382,7 @@ for r in range(num_runs):
             preds.append(take_block)
             len_preds += take
 
+            # 다음 입력 업데이트 (RevIN 역정규화된 예측값 사용)
             new_X = np.concatenate([curr_X.cpu().numpy(), take_block], axis=0)
             curr_X = torch.from_numpy(new_X[-P:, :]).float().to(device).contiguous()
 
@@ -388,18 +427,34 @@ smoothed_fut = smoothed_dat[-horizon:, :]
 smoothed_conf_fut = smoothed_confidence[-horizon:, :]
 
 # 날짜 설정
-HIST_END = pd.Timestamp("2025-07-01")
+# 규칙 4: forecast 예측기간은 26년 1월~12월 (1년 = 12개월)
+HIST_END = pd.Timestamp("2025-12-01")
 dates_hist = pd.date_range(end=HIST_END, periods=len(df), freq="MS").tolist()
 
-FORECAST_START = HIST_END + pd.DateOffset(months=1)
+FORECAST_START = pd.Timestamp("2026-01-01")  # 26년 1월부터 시작
 dates_future = pd.date_range(start=FORECAST_START, periods=horizon, freq="MS").tolist()
 
 print(f"Forecast range: {dates_future[0].strftime('%Y-%m')} ~ {dates_future[-1].strftime('%Y-%m')}")
 
-# 플롯 대상 선택 (US Trade Weighted Dollar Index + 4개 환율)
-target_keywords = ['us_trade', 'weighted', 'kr_fx', 'cn_fx', 'jp_fx', 'uk_fx']
-target_indices = sorted(list(set([i for k in target_keywords for i, n in enumerate(col) if k.lower() in n.lower()])))
-if not target_indices: 
+# 플롯 대상 선택: 달러 인덱스(us_Trade Weighted Dollar Index), kr_fx, jp_fx만 사용
+desired_targets = ['us_Trade Weighted Dollar Index', 'kr_fx', 'jp_fx']
+desired_lower = {t.lower() for t in desired_targets}
+target_indices = [i for i, n in enumerate(col) if n.lower() in desired_lower]
+
+# 만약 컬럼명이 조금 다를 경우(대소문자/공백 등) 대비용 fallback
+if not target_indices:
+    target_indices = []
+    for i, n in enumerate(col):
+        name_lower = n.lower()
+        if 'us_trade weighted dollar index' in name_lower or name_lower == 'us_trade weighted dollar index':
+            target_indices.append(i)
+        elif 'kr_fx' in name_lower:
+            target_indices.append(i)
+        elif 'jp_fx' in name_lower:
+            target_indices.append(i)
+
+target_indices = sorted(list(set(target_indices)))
+if not target_indices:
     target_indices = list(range(m))
 
 plot_colours = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
@@ -415,6 +470,8 @@ for idx, i in enumerate(target_indices):
 
 # Multi-Node Plot - FULL
 print("Generating multi-node plots...")
+# 마지막 예측 날짜(2026-12-01)가 그래프 맨 끝에 오도록 x_end 설정
+forecast_end = dates_future[-1] + pd.Timedelta(days=15)  # 약간의 여유만 둠
 plot_multi_node(
     dates_hist=dates_hist,
     dates_future=dates_future,
@@ -427,7 +484,7 @@ plot_multi_node(
     plot_colours=plot_colours,
     out_path=os.path.join(plot_dir, "Multi_Node_Index_FULL.png"),
     x_start=dates_hist[0],
-    x_end=pd.Timestamp("2028-07-31"),
+    x_end=forecast_end,
 )
 
 # Multi-Node Plot - ZOOM
@@ -443,7 +500,7 @@ plot_multi_node(
     plot_colours=plot_colours,
     out_path=os.path.join(plot_dir, "Multi_Node_Index_ZOOM.png"),
     x_start=pd.Timestamp("2022-08-01"),
-    x_end=pd.Timestamp("2028-07-31"),
+    x_end=forecast_end,
 )
 
 print("=== 최종 완료 ===")

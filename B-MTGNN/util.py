@@ -265,7 +265,11 @@ class DataLoaderS(object):
         self.test_window = self.dat[-test_window_len:, :].clone()
 
     def _batchify(self, idx_set, horizon):
-        n = len(idx_set) 
+        n = len(idx_set)
+        # 빈 set이거나 out_len보다 작은 경우 빈 텐서 반환
+        if n <= self.out_len:
+            return torch.zeros((0, self.P, self.m)), torch.zeros((0, self.out_len, self.m))
+        
         X = torch.zeros((n - self.out_len, self.P, self.m)) 
         Y = torch.zeros((n - self.out_len, self.out_len, self.m)) 
 

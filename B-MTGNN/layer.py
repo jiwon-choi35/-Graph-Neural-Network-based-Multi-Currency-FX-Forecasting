@@ -37,21 +37,20 @@ class prop(nn.Module):
         self.mlp = linear(c_in,c_out)
         self.gdep = gdep
         self.dropout = dropout
-        self.alpha = alpha    
+        self.alpha = alpha
 
-def forward(self,x,adj):
-    adj = adj + torch.eye(adj.size(0)).to(x.device)
-    d = adj.sum(1)
-    h = x
-    dv = d
-    a = adj / dv.view(-1, 1)
-    for i in range(self.gdep):
-        h = self.alpha*x + (1-self.alpha)*self.nconv(h,a)
+    def forward(self, x, adj):
+        adj = adj + torch.eye(adj.size(0)).to(x.device)
+        d = adj.sum(1)
+        h = x
+        a = adj / d.view(-1, 1)
+        for i in range(self.gdep):
+            h = self.alpha * x + (1 - self.alpha) * self.nconv(h, a)
         ho = self.mlp(h)
-    return ho
+        return ho
 
 
-    # ⚠️ 이 코드가 기존 정적 mixprop 자리에 들어가야 합니다. (이름만 mixprop)
+# ⚠️ mixprop: 정적 그래프 전파 (MTGNN 원본 스타일)
 class mixprop(nn.Module):
         """
         Static graph multi-hop propagation (MTGNN original style)
