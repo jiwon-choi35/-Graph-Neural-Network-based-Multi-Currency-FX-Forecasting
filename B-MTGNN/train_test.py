@@ -195,7 +195,7 @@ def s_mape(yTrue, yPred):
     return mape
 
 
-def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_input, is_plot):
+def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_input, is_plot, smooth_alpha=0.7, clamp_ratio=0.1):
     total_loss = 0
     total_loss_l1 = 0
     n_samples = 0
@@ -215,9 +215,6 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
 
     # [수정 1] fixed_wm, fixed_ws 변수 및 관련 로직 제거
     # 매 반복문(Sliding Window)마다 통계를 새로 계산해야 함
-
-    # Monte Carlo Dropout: 추론 시에도 dropout 활성화하여 불확실성 정량화 (문서 권장)
-    model.train()
 
     for i in range(n_input, test_window.shape[0], data.out_len):
         X = torch.unsqueeze(x_input, dim=0)
@@ -242,8 +239,7 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
 
         y_true = test_window[i: i + data.out_len, :].clone()
 
-        # 문서 권장: 30회 반복으로 불확실성 추정 (성능·효율 균형)
-        num_runs = 30
+        num_runs = 10
         outputs = []
 
         for _ in range(num_runs):
@@ -269,18 +265,16 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
         z = 1.96
         confidence = z * std_dev / torch.sqrt(torch.tensor(num_runs))
 
-        # ===== B: Smoothing/Clamping (예측값 안정화) =====
-        if last_predicted is not None:
-            # Exponential smoothing: 0.7 * 현재 예측 + 0.3 * 이전 예측
-            y_pred = 0.7 * y_pred + 0.3 * last_predicted
-            
-            # Clamping: 이전 실제값 대비 ±10% 제한 (첫 step 이후)
-            if i > n_input:
-                last_actual = test_window[i-1, :]
-                y_pred = torch.clamp(y_pred, last_actual * 0.9, last_actual * 1.1)
-        
+        # ===== B: Smoothing/Clamping (예측값 안정화, 순수 모델 성능 보려면 smooth_alpha=1.0, clamp_ratio=0) =====
+        if last_predicted is not None and smooth_alpha < 1.0:
+            # Exponential smoothing: smooth_alpha * 현재 + (1-smooth_alpha) * 이전
+            y_pred = smooth_alpha * y_pred + (1.0 - smooth_alpha) * last_predicted
+        if clamp_ratio > 0 and i > n_input:
+            # Clamping: 이전 실제값 대비 ±(clamp_ratio*100)% 제한 (0이면 미적용)
+            last_actual = test_window[i-1, :]
+            y_pred = torch.clamp(y_pred, last_actual * (1.0 - clamp_ratio), last_actual * (1.0 + clamp_ratio))
         last_predicted = y_pred.clone()
-        # ================================================================
+        # ==================================================
 
         # 다음 스텝을 위한 입력 업데이트 (Sliding Window)
         if data.P <= data.out_len:
@@ -385,9 +379,6 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
     r = 5
     print('validation r=', str(r))
 
-    # Monte Carlo Dropout: 추론 시에도 dropout 활성화하여 불확실성 정량화 (문서 권장)
-    model.train()
-
     for X, Y in data.get_batches(X, Y, batch_size, False):
         X = torch.unsqueeze(X, dim=1)
         X = X.transpose(2, 3)  # [B, 1, N, T]
@@ -402,8 +393,7 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
         ws = w_std[:, 0, :, 0]   # [B, N]
         # ============================================
 
-        # 문서 권장: 30회 반복으로 불확실성 추정 (성능·효율 균형)
-        num_runs = 30
+        num_runs = 10
         outputs = []
 
         with torch.no_grad():
@@ -506,13 +496,13 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
             smape += s_mape(Ytest[x, :, z], predict[x, :, z])
     smape /= Ytest.shape[0] * Ytest.shape[2]
 
-    # ===== jp_fx 개별 RSE 계산 (Best 모델 선택 기준용) =====
+    # ===== jp_fx, kr_fx 개별 RSE 계산 (Best 모델 선택 기준용) =====
     jp_fx_rse = None
+    kr_fx_rse = None
     target_nodes = ['us_Trade Weighted Dollar Index', 'kr_fx', 'jp_fx']
     for v in range(data.m):
         raw_name = data.col[v]
         if raw_name == 'jp_fx':
-            # jp_fx 노드의 RSE 계산
             jp_pred = predict[:, 0, v]
             jp_true = Ytest[:, 0, v]
             jp_diff_sq = np.sum((jp_pred - jp_true) ** 2)
@@ -522,9 +512,20 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
                 jp_fx_rse = np.sqrt(jp_diff_sq / jp_diff_from_mean_sq)
             else:
                 jp_fx_rse = 0.0
-            break
+        elif raw_name == 'kr_fx':
+            kr_pred = predict[:, 0, v]
+            kr_true = Ytest[:, 0, v]
+            kr_diff_sq = np.sum((kr_pred - kr_true) ** 2)
+            kr_mean = np.mean(kr_true)
+            kr_diff_from_mean_sq = np.sum((kr_true - kr_mean) ** 2)
+            if kr_diff_from_mean_sq > 0:
+                kr_fx_rse = np.sqrt(kr_diff_sq / kr_diff_from_mean_sq)
+            else:
+                kr_fx_rse = 0.0
     if jp_fx_rse is None:
-        jp_fx_rse = rrse  # jp_fx를 찾지 못한 경우 전체 RSE 사용
+        jp_fx_rse = rrse
+    if kr_fx_rse is None:
+        kr_fx_rse = rrse
     # ========================================================
 
     counter = 0
@@ -541,7 +542,7 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
             save_metrics_1d(torch.from_numpy(predict[:, 0, col]), torch.from_numpy(Ytest[:, 0, col]), node_name, 'Validation')
             plot_predicted_actual(predict[:, 0, col], Ytest[:, 0, col], node_name, 'Validation', variance[:, 0, col], confidence_95[:, 0, col])
             counter += 1
-    return rrse, rae, correlation, smape, jp_fx_rse
+    return rrse, rae, correlation, smape, jp_fx_rse, kr_fx_rse
 
 
 def train(data, X, Y, model, criterion, optim, batch_size):
@@ -550,13 +551,17 @@ def train(data, X, Y, model, criterion, optim, batch_size):
     n_samples = 0
     iter = 0
 
-    # ===== Target-Weighted Loss (권장: jp_fx 40, kr_fx/Us 20) =====
-    target_weight = torch.ones(data.m, device=device)
+    # ===== Target-Weighted Loss =====
+    # us_Trade Weighted Dollar Index, kr_fx: 기본 가중치 (10.0)
+    # jp_fx: 더 강하게 학습 (20.0)
+    target_weight = torch.ones(data.m, device=device) 
     for i, col_name in enumerate(data.col):
-        if col_name == 'us_Trade Weighted Dollar Index' or col_name == 'kr_fx':
+        if col_name == 'us_Trade Weighted Dollar Index':
+            target_weight[i] = 10.0
+        elif col_name == 'kr_fx':
             target_weight[i] = 20.0
         elif col_name == 'jp_fx':
-            target_weight[i] = 50.0
+            target_weight[i] = 20.0
     print(f"[Target-Weighted Loss] weights applied: "
           f"{ {data.col[i]: target_weight[i].item() for i in range(data.m) if target_weight[i] > 1} }")
     # ==================================
@@ -632,8 +637,7 @@ def train(data, X, Y, model, criterion, optim, batch_size):
     return total_loss / n_samples
 
 
-# 데이터 폴더 기준: data/data.csv (Date 포함). 기존 루트 파일 사용 시 --data AXIS/ExchangeRate_dataset.csv
-DEFAULT_DATA_PATH = AXIS_DIR / 'data' / 'data.csv'
+DEFAULT_DATA_PATH = AXIS_DIR / 'data' / 'sm_data.csv'
 DEFAULT_MODEL_SAVE = MODEL_BASE_DIR / 'model.pt'
 
 parser = argparse.ArgumentParser(description='PyTorch Time series forecasting')
@@ -662,17 +666,17 @@ parser.add_argument('--seq_out_len', type=int, default=1, help='output sequence 
 parser.add_argument('--horizon', type=int, default=1)
 parser.add_argument('--layers', type=int, default=1, help='number of layers')
 parser.add_argument('--batch_size', type=int, default=4, help='batch size')
-parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
+parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
 parser.add_argument('--weight_decay', type=float, default=0.00001, help='weight decay rate')
 parser.add_argument('--clip', type=int, default=10, help='clip')
 parser.add_argument('--propalpha', type=float, default=0.6, help='prop alpha')
 parser.add_argument('--tanhalpha', type=float, default=0.1, help='tanh alpha')
-parser.add_argument('--epochs', type=int, default=400, help='')
+parser.add_argument('--epochs', type=int, default=300, help='')
 parser.add_argument('--num_split', type=int, default=1, help='number of splits for graphs')
 parser.add_argument('--step_size', type=int, default=100, help='step_size')
-parser.add_argument('--smooth', action='store_true', help='Apply double exponential smoothing before training (권장: RSE 개선 시 사용)')
-parser.add_argument('--smooth_alpha', type=float, default=0.15, help='Smoothing alpha (Holt) when --smooth')
-parser.add_argument('--smooth_beta', type=float, default=0.25, help='Smoothing beta (Holt) when --smooth')
+# Sliding window 테스트 후처리 (순수 모델 성능: --test_smooth_alpha 1.0 --test_clamp_ratio 0)
+parser.add_argument('--test_smooth_alpha', type=float, default=0.7, help='Testing smoothing 가중치(현재예측), 1.0=비활성')
+parser.add_argument('--test_clamp_ratio', type=float, default=0.1, help='Testing clamp ±비율(이전값기준), 0=비활성')
 
 
 args = parser.parse_args()
@@ -705,7 +709,7 @@ def main(experiment):
     best_rae = 10000000
     best_corr = -10000000
     best_smape = 10000000
-    best_combined_score = 10000000  # Best 모델 선택: 0.3*val_loss + 0.7*jp_fx_val_rse
+    best_combined_score = 10000000  # Best 모델 선택 기준: val_loss + jp_fx RSE + kr_fx RSE
 
     best_test_rse = 10000000
     best_test_corr = -10000000
@@ -745,16 +749,7 @@ def main(experiment):
         print("!!! Cache Clean Complete !!!")
         # ============================================================
 
-        data_path = args.data
-        if getattr(args, 'smooth', False):
-            from smoothing import smooth_csv_file
-            data_dir = Path(args.data).parent
-            sm_path = data_dir / 'sm_data.csv'
-            smooth_csv_file(args.data, sm_path, alpha=args.smooth_alpha, beta=args.smooth_beta)
-            data_path = str(sm_path)
-            print('Using smoothed data:', data_path)
-
-        Data = DataLoaderS(data_path, 0.60, 0.20, device, args.horizon, args.seq_in_len, args.normalize, args.seq_out_len)
+        Data = DataLoaderS(args.data, 0.60, 0.20, device, args.horizon, args.seq_in_len, args.normalize, args.seq_out_len)
 
         print('train X:', Data.train[0].shape)
         print('train Y:', Data.train[1].shape)
@@ -826,18 +821,18 @@ def main(experiment):
 
                 epoch_start_time = time.time()
                 train_loss = train(Data, Data.train[0], Data.train[1], model, criterion, optim, args.batch_size)
-                val_loss, val_rae, val_corr, val_smape, jp_fx_val_rse = evaluate(Data, Data.valid[0], Data.valid[1], model, evaluateL2, evaluateL1,
+                val_loss, val_rae, val_corr, val_smape, jp_fx_val_rse, kr_fx_val_rse = evaluate(Data, Data.valid[0], Data.valid[1], model, evaluateL2, evaluateL1,
                                                                   args.batch_size, False)
                 print(
-                    '| end of epoch {:3d} | time: {:5.2f}s | train_loss {:5.4f} | valid rse {:5.4f} | valid rae {:5.4f} | valid corr  {:5.4f} | valid smape  {:5.4f} | jp_fx_rse {:5.4f}'.format(
-                        epoch, (time.time() - epoch_start_time), train_loss, val_loss, val_rae, val_corr, val_smape, jp_fx_val_rse), flush=True)
+                    '| end of epoch {:3d} | time: {:5.2f}s | train_loss {:5.4f} | valid rse {:5.4f} | valid rae {:5.4f} | valid corr  {:5.4f} | valid smape  {:5.4f} | jp_fx_rse {:5.4f} | kr_fx_rse {:5.4f}'.format(
+                        epoch, (time.time() - epoch_start_time), train_loss, val_loss, val_rae, val_corr, val_smape, jp_fx_val_rse, kr_fx_val_rse), flush=True)
                 
                 scheduler.step(val_loss)
                 
-                # ===== Best 모델 선택 기준: 0.3*val_loss + 0.7*jp_fx RSE (목표 노드 비중 확대) =====
+                # ===== Best 모델 선택 기준: val_loss + jp_fx RSE + kr_fx RSE =====
                 safe_corr = val_corr if not math.isnan(val_corr) else 0.0
                 sum_loss = val_loss + val_rae - safe_corr
-                combined_score = 0.3 * val_loss + 0.7 * jp_fx_val_rse
+                combined_score = 0.4 * val_loss + 0.25 * jp_fx_val_rse + 0.35 * kr_fx_val_rse
                 
                 if combined_score < best_combined_score:
                     save_path = Path(args.save)
@@ -857,7 +852,7 @@ def main(experiment):
                     es_counter = 0
 
                     test_acc, test_rae, test_corr, test_smape = evaluate_sliding_window(Data, Data.test_window, model, evaluateL2, evaluateL1,
-                                                                                        args.seq_in_len, False)
+                                                                                        args.seq_in_len, False, args.test_smooth_alpha, args.test_clamp_ratio)
                     print('********************************************************************************************************')
                     print("test rse {:5.4f} | test rae {:5.4f} | test corr {:5.4f}| test smape {:5.4f}".format(test_acc, test_rae, test_corr, test_smape), flush=True)
                     print('********************************************************************************************************')
@@ -878,14 +873,13 @@ def main(experiment):
 
     with open(args.save, 'rb') as f:
         model = torch.load(f, weights_only=False)
-    # 로드한 모델도 학습 시와 같은 device로 이동
     model = model.to(device)
 
-    vtest_acc, vtest_rae, vtest_corr, vtest_smape, _ = evaluate(Data, Data.valid[0], Data.valid[1], model, evaluateL2, evaluateL1,
+    vtest_acc, vtest_rae, vtest_corr, vtest_smape, _, _ = evaluate(Data, Data.valid[0], Data.valid[1], model, evaluateL2, evaluateL1,
                                                              args.batch_size, True)
 
     test_acc, test_rae, test_corr, test_smape = evaluate_sliding_window(Data, Data.test_window, model, evaluateL2, evaluateL1,
-                                                                        args.seq_in_len, True)
+                                                                        args.seq_in_len, True, args.test_smooth_alpha, args.test_clamp_ratio)
     print('********************************************************************************************************')
     print("final test rse {:5.4f} | test rae {:5.4f} | test corr {:5.4f} | test smape {:5.4f}".format(test_acc, test_rae, test_corr, test_smape))
     print('********************************************************************************************************')
