@@ -137,6 +137,8 @@ class DataLoaderS(object):
                 raise ValueError(f"Failed to load data: {e2}")
             date_series = None
 
+        # 플롯 시작 날짜용: 행 인덱스 → (year, month) 조회
+        self.date_series = date_series  # pandas Series or None, 길이 = n
         self.rawdat = torch.from_numpy(self.rawdat_np).float()
 
         self.shift = 0
@@ -165,6 +167,23 @@ class DataLoaderS(object):
                  self.col = [str(i) for i in range(self.m)]
         except:
              self.col = [str(i) for i in range(self.m)]
+
+        # Target-weighted loss: FX 변수에 극대화된 가중치 적용 (loss 압도)
+        # [수정] kr_fx 가중치를 낮춰 과적합 방지 및 다른 변수와의 균형 회복
+        # 기존: kr=50, jp=30, us=30 → kr 압도적으로 높아 학습 불안정
+        # 변경: kr=20, jp=20, us=20 → 균형 잡힌 가중치로 전반적 예측력 향상
+        self.target_weight = torch.ones(self.m, device=device) * 0.1  # 나머지 변수는 0.1
+        for v in range(self.m):
+            if self.col[v] == 'kr_fx':
+                self.target_weight[v] = 20.0
+            elif self.col[v] == 'jp_fx':
+                self.target_weight[v] = 20.0
+            elif self.col[v] == 'us_Trade Weighted Dollar Index':
+                self.target_weight[v] = 20.0
+        fx_total = 20.0 + 20.0 + 20.0
+        others_total = (self.m - 3) * 0.1
+        fx_ratio = fx_total / (fx_total + others_total) * 100
+        print(f"[Target Weight] kr_fx=20.0, jp_fx=20.0, us=20.0, others=0.1 (FX 비중: {fx_ratio:.1f}%)")
 
         # 그래프 경로: 데이터 파일과 같은 폴더의 graph.csv, 없으면 (데이터파일 부모)/data/graph.csv
         data_path = Path(file_name).resolve()
@@ -223,6 +242,19 @@ class DataLoaderS(object):
             print(f"Date-based split failed ({e}), using ratio.")
         return int(train_ratio * self.n), int((train_ratio + valid_ratio) * self.n)
 
+    def get_date_at_index(self, idx):
+        """행 인덱스 idx에 해당하는 날짜를 (year, month)로 반환. Date 없으면 None."""
+        if not hasattr(self, 'date_series') or self.date_series is None or idx < 0 or idx >= len(self.date_series):
+            return None
+        try:
+            s = str(self.date_series.iloc[idx]).strip()
+            parts = s.split('-')
+            if len(parts) >= 2:
+                return int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+        return None
+
     def _normalized(self, normalize):
         if (normalize == 0):
             self.dat = self.rawdat
@@ -241,7 +273,7 @@ class DataLoaderS(object):
             # Avoid division by zero
             self.dat[:, mask] = self.rawdat[:, mask] / max_abs_val[mask]
 
-        # z-score normalization: (x - mean) / std
+        # z-score normalization: (x - mean) / std (global, 모든 시점이 같은 기준)
         if (normalize == 3):
             col_mean = self.rawdat.mean(dim=0)
             col_std = self.rawdat.std(dim=0)
@@ -249,38 +281,119 @@ class DataLoaderS(object):
             self.scale = col_std
             self.shift = col_mean
             self.dat = (self.rawdat - col_mean) / col_std
+            
+            # 역정규화용: per-step rolling 통계 저장 (그래프 출력 정확도 유지)
+            window_size = 24
+            self.rolling_mean = torch.zeros(self.n, self.m)
+            self.rolling_std = torch.ones(self.n, self.m)
+            
+            for t in range(self.n):
+                start_idx = max(0, t - window_size + 1)
+                window_data = self.rawdat[start_idx:t+1, :]
+                
+                if window_data.size(0) < 2:
+                    self.rolling_mean[t, :] = col_mean
+                    self.rolling_std[t, :] = col_std
+                else:
+                    rolling_mean_t = window_data.mean(dim=0)
+                    rolling_std_t = window_data.std(dim=0)
+                    rolling_std_t[rolling_std_t == 0] = 1
+                    self.rolling_mean[t, :] = rolling_mean_t
+                    self.rolling_std[t, :] = rolling_std_t
+            
+            print(f"[Global Z-score] 정규화: 전체 기간 통계 사용, 역정규화: per-step rolling 통계 사용 (window={window_size})")
+
+        # rolling z-score normalization: 각 시점에서 직전 24개월(또는 가능한 만큼)의 평균/표준편차 사용
+        if (normalize == 4):
+            window_size = 24
+            self.dat = torch.zeros_like(self.rawdat)
+            
+            col_mean_global = self.rawdat.mean(dim=0)
+            col_std_global = self.rawdat.std(dim=0)
+            col_std_global[col_std_global == 0] = 1
+            
+            # per-step rolling 통계 저장 (정확한 역정규화용)
+            self.rolling_mean = torch.zeros(self.n, self.m)
+            self.rolling_std = torch.ones(self.n, self.m)
+            
+            for t in range(self.n):
+                start_idx = max(0, t - window_size + 1)
+                window_data = self.rawdat[start_idx:t+1, :]
+                
+                if window_data.size(0) < 2:
+                    col_mean = col_mean_global
+                    col_std = col_std_global
+                else:
+                    col_mean = window_data.mean(dim=0)
+                    col_std = window_data.std(dim=0)
+                    col_std[col_std == 0] = 1
+                
+                self.rolling_mean[t, :] = col_mean
+                self.rolling_std[t, :] = col_std
+                self.dat[t, :] = (self.rawdat[t, :] - col_mean) / col_std
+            
+            self.scale = col_std_global
+            self.shift = col_mean_global
+            print(f"[Rolling Z-score] window={window_size}, per-step rolling_mean/std 저장 완료")
 
     def _split(self, train, valid, test):
         # util.py Logic: Strictly separates Train / Valid / Test ranges
-        train_set = range(self.P + self.h - 1, train) 
-        valid_set = range(train, valid) 
-        test_set = range(valid, self.n)
-        
+        train_set = range(self.P + self.h - 1, train)
+        valid_set = range(train, valid)
+        test_set  = range(valid, self.n)
+
         self.train = self._batchify(train_set, self.h)
         self.valid = self._batchify(valid_set, self.h)
-        self.test = self._batchify(test_set, self.h)
+        self.test  = self._batchify(test_set,  self.h)
 
-        num_test_points = len(test_set)
-        test_window_len = num_test_points + self.P
+        # test_window: 직전 P개(실제 과거) + test 구간 전체
+        num_test_points  = len(test_set)
+        test_window_len  = num_test_points + self.P
         self.test_window = self.dat[-test_window_len:, :].clone()
+
+        # [추가] valid_window: 직전 P개(train 끝) + valid 구간 전체
+        # → evaluate_sliding_window에서 validation에도 오토리그레시브 방식 적용 가능
+        num_valid_points  = len(valid_set)
+        valid_window_len  = num_valid_points + self.P
+        # train 끝(=valid 시작) 직전 P개부터 valid 끝까지
+        valid_window_start = max(train - self.P, 0)
+        self.valid_window  = self.dat[valid_window_start:valid, :].clone()
+
+        self.valid_start_idx = train
+        self.test_start_idx  = valid
 
     def _batchify(self, idx_set, horizon):
         n = len(idx_set)
-        # 빈 set이거나 out_len보다 작은 경우 빈 텐서 반환
-        if n <= self.out_len:
+        if n == 0:
             return torch.zeros((0, self.P, self.m)), torch.zeros((0, self.out_len, self.m))
-        
-        X = torch.zeros((n - self.out_len, self.P, self.m)) 
-        Y = torch.zeros((n - self.out_len, self.out_len, self.m)) 
 
-        for i in range(n - self.out_len): 
-            end = idx_set[i] - self.h + 1 
-            start = end - self.P 
-            
-            # Optimized: Direct tensor slicing
-            X[i, :, :] = self.dat[start:end, :]
-            Y[i, :, :] = self.dat[idx_set[i]:idx_set[i]+self.out_len, :] 
-            
+        num_samples = max(n - self.out_len + 1, 0)
+        if num_samples == 0:
+            return torch.zeros((0, self.P, self.m)), torch.zeros((0, self.out_len, self.m))
+
+        valid_samples = []
+        for i in range(num_samples):
+            y_end = idx_set[i] + self.out_len
+            if y_end > self.n:
+                break
+            end = idx_set[i] - self.h + 1
+            start = end - self.P
+            if start < 0:
+                continue
+            valid_samples.append(i)
+
+        if len(valid_samples) == 0:
+            return torch.zeros((0, self.P, self.m)), torch.zeros((0, self.out_len, self.m))
+
+        X = torch.zeros((len(valid_samples), self.P, self.m))
+        Y = torch.zeros((len(valid_samples), self.out_len, self.m))
+
+        for j, i in enumerate(valid_samples):
+            end = idx_set[i] - self.h + 1
+            start = end - self.P
+            X[j, :, :] = self.dat[start:end, :]
+            Y[j, :, :] = self.dat[idx_set[i]:idx_set[i]+self.out_len, :]
+
         return [X, Y]
 
     def get_batches(self, inputs, targets, batch_size, shuffle=True):
