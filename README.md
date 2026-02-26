@@ -59,3 +59,12 @@ The operational model is saved in the directory **AXIS/model/Bayesian**.
 The script in the file **forecast.py** uses the operational model **model.pt** in the directory **AXIS/model/Bayesian** to produce forecasts for the exchange rates and economic indicators.
 
 The results include numerical forecasts of each node, stored in the directory:
+
+
+Below is the final multi-country normalized forecast:
+
+<p align="center">
+<a href="https://raw.githubusercontent.com/jiwon-choi35/-Graph-Neural-Network-based-Multi-Currency-FX-Forecasting/feature/FinalMultisteps-dollarIndex/Cyber-trend-forecasting-main%203/AXIS/model/Bayesian/forecast/plots/Multi_Country_Forecast_Normalized.pdf">
+Download Full Forecast PDF
+</a>
+</p>
