@@ -2,7 +2,7 @@
 
 This is a Python implementation of a Bayesian multi-task graph neural network (B-MTGNN) framework for forecasting foreign exchange (FX) rates and related economic indicators.
 
-This repository contains an end-to-end framework for forecasting exchange rate trends and pertinent economic indicators using graph neural networks. This includes data preparation, model development, hyperparameter optimization, and future forecasts up to 3 years in advance.
+This repository contains an end-to-end framework for forecasting exchange rate trends and pertinent economic indicators using graph neural networks. This includes data preparation, model development, hyperparameter optimization, and future forecasts up to 1 years in advance.
 
 ## Dataset
 
@@ -17,7 +17,7 @@ The directory **B-MTGNN** contains the core PyTorch implementation of the Bayesi
 - **Multi-Task Learning**: Forecasts multiple exchange rates and economic indicators simultaneously
 - **Graph Neural Networks**: Models relationships between different economic variables as a graph
 - **Bayesian Inference**: Uses Monte Carlo dropout for uncertainty quantification
-- **3-Year Forecasting Horizon**: Predicts trends 36 months into the future
+- **1-Year Forecasting Horizon**: Predicts trends 12 months into the future
 
 ## Model Training & Optimization
 
@@ -120,3 +120,4 @@ If you use this framework, please cite this work.
 ## License
 
 This project is provided for research and development purposes.
+
