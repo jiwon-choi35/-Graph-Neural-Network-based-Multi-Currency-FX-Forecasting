@@ -1,62 +1,122 @@
 # Exchangeprediction
 
-This is a PyTorch implementation of the Bayesian multi-task graph neural network model for forecasting foreign exchange (FX) rates and pertinent economic indicators. The model extends the [MTGNN](https://dl.acm.org/doi/abs/10.1145/3394486.3403118) model proposed by Wu et al. The graph represents relationships between multiple exchange rates (USD/JPY, USD/KRW, US Trade Weighted Dollar Index) and relevant economic indicators such as CPI, GDP, interest rates, employment, trade balance, and unemployment across different countries. Each node represents an economic variable, and the value of the node represents the trend.
+This is a Python implementation of a Bayesian multi-task graph neural network (B-MTGNN) framework for forecasting foreign exchange (FX) rates and related economic indicators.
 
-In our extension for the model, we employ the Bayesian approach to capture epistemic uncertainty. Specifically, we employ the Monte Carlo dropout method where the use of dropout neurons during inference provides a Bayesian approximation of the deep Gaussian processes. Therefore, during the prediction phase, the trained model runs multiple times, which results in a distribution of prediction (representing the uncertainty) rather than a single point.
+This repository contains an end-to-end framework for forecasting exchange rate trends and pertinent economic indicators using graph neural networks. This includes data preparation, model development, hyperparameter optimization, and future forecasts up to 3 years in advance.
+
+## Dataset
+
+The dataset includes foreign exchange rates (USD/JPY, USD/KRW, US Trade Weighted Dollar Index) and related economic indicators across multiple countries (US, Japan, South Korea). Economic indicators include CPI, GDP, interest rates, employment, trade balance, and unemployment. Data spans from January 2011 to December 2025 on a monthly basis.
+
+## Model Architecture
+
+The directory **B-MTGNN** contains the core PyTorch implementation of the Bayesian multi-task graph neural network model. The model extends the MTGNN architecture with Bayesian inference using Monte Carlo dropout to capture epistemic uncertainty in predictions. This results in prediction distributions rather than point estimates.
+
+### Key Features:
+
+- **Multi-Task Learning**: Forecasts multiple exchange rates and economic indicators simultaneously
+- **Graph Neural Networks**: Models relationships between different economic variables as a graph
+- **Bayesian Inference**: Uses Monte Carlo dropout for uncertainty quantification
+- **3-Year Forecasting Horizon**: Predicts trends 36 months into the future
+
+## Model Training & Optimization
+
+The scripts in the **B-MTGNN** directory perform:
+
+1. **Hyperparameter Optimization** (`train_test.py`): Random search to find optimal model hyperparameters, producing `hp.txt`
+2. **Model Training** (`train.py`): Trains the final model using optimal hyperparameters
+3. **Performance Evaluation**: Validation and testing with metrics RSE (Root Relative Squared Error) and RAE (Relative Absolute Error)
+   - Results stored in `AXIS/model/Bayesian/Validation/` and `AXIS/model/Bayesian/Testing/`
+
+## Operational Model & Results
+
+The directory **AXIS** contains the trained operational model and all outputs:
+
+### Model Files:
+
+- `model/Bayesian/model.pt` - The final trained Bayesian MTGNN model
+
+### Forecast Outputs:
+
+- **Data**: `model/Bayesian/forecast/data/` - Numerical forecasts for each economic variable
+- **Plots**: `model/Bayesian/forecast/plots/` - Visualization of historical and forecasted trends
+  - Individual plots for each exchange rate
+  - Multi-country normalized comparison plot
+- **Gap Analysis**: `model/Bayesian/forecast/gap/` - Gap analysis between target variables
+
+## Forecast Results
+
+The script `forecast.py` uses the trained model to generate:
+
+1. **Individual Forecasts**: 12-month forecasts (2026-01 to 2026-12) for each economic variable
+2. **Multi-Country Comparison**: Normalized comparison of major exchange rates showing forecast uncertainty bands (95% prediction intervals)
+3. **Gap Analysis**: Differences between forecasted exchange rates and economic indicators stored in CSV format
+
+Below is an example of exchange rate forecasts with uncertainty quantification:
+
+<p align="center">
+<a href="url"><img src="./AXIS/model/Bayesian/forecast/plots/Multi_Country_Forecast_Normalized.png" align="centre"  width="600"   ></a>
+</p>
+
+## Model Specifications
+
+- **Input Sequence Length**: 24 months (2 years of historical data)
+- **Forecast Horizon**: 12 months (2026)
+- **MC Runs**: 20 dropout iterations for Bayesian approximation
+- **Evaluation Metrics**: RSE and RAE across 33 economic variables
+- **Architecture**: Graph neural network with attention mechanisms
+
+## Usage
+
+### Training & Optimization
+
+```bash
+python train_test.py
+```
+
+### Generating Future Forecasts
+
+```bash
+python forecast.py
+```
+
+### Visualization
+
+Generated plots are automatically saved in:
+
+- `AXIS/model/Bayesian/forecast/plots/` - High-resolution PNG and PDF formats
 
 ## Requirements
-The model is implemented using Python3 with dependencies specified in requirements.txt
 
-## Data Smoothing
-All data files used by the model including the graph adjacency file can be found in the directory called **data**.
+Python 3.8+ with PyTorch and dependencies specified in the project requirements.
 
-Data preprocessing and smoothing are performed to prepare the raw economic indicators for model training. The smoothed data is used as input to the neural network.
+## Project Structure
 
-## Hyper-parameter Optimisation
-The hyper-parameter optimisation is performed in the file **train_test.py**. This script performs random search to produce the optimal set of hyper-parameters. These hyper-parameters are finally saved as an output in the file called **hp.txt**, which is in the directory **model/Bayesian**. The output also includes validation and testing results when using the optimal set of hyper-parameters. These results include plots for the predicted curves against the actual curves. These are saved in the directories called **Validation** and **Testing** within the directory **model/Bayesian**. For the evaluation, 2 metrics are used namely the Root Relative Squared Error (RSE) and the Relative Absolute Error (RAE). These metrics are saved in the same directories (Validation and Testing), and the average values of these metrics across all nodes are also displayed on the console as a final output. 
+```
+├── AXIS/                    # Model outputs and results
+│   └── model/Bayesian/     # Trained model and forecasts
+│       ├── model.pt
+│       ├── forecast/
+│       │   ├── data/       # Numerical forecasts
+│       │   ├── plots/      # Visualizations
+│       │   └── gap/        # Gap analysis
+│       ├── Testing/        # Test set results
+│       └── Validation/     # Validation set results
+│
+└── B-MTGNN/                 # Model implementation
+    ├── forecast.py          # Generate future forecasts
+    ├── train_test.py        # Hyperparameter optimization
+    ├── net.py              # Model architecture
+    ├── trainer.py          # Training routines
+    ├── layer.py            # Custom layers
+    ├── util.py             # Utilities
+    └── data/               # Input data files
+```
 
-Below is an example for the model validation results across key variables - exchange rates and economic indicators.
+## Citation
 
-<p align="center">
-  <img src="./AXIS/model/Bayesian/Validation/Jp_fx_Validation.png" width="600" />
-</p>
+If you use this framework, please cite this work.
 
-<p align="center">
-  <img src="./AXIS/model/Bayesian/Validation/Kr_fx_Validation.png" width="600" />
-</p>
+## License
 
-<p align="center">
-  <img src="./AXIS/model/Bayesian/Validation/US_Unemployment_Validation.png" width="600" />
-</p>
-
-## Testing Results (Key FX Variables)
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/jiwon-choi35/-Graph-Neural-Network-based-Multi-Currency-FX-Forecasting/feature/FinalMultisteps-dollarIndex/Cyber-trend-forecasting-main%203/AXIS/model/Bayesian/Testing/Jp_fx_Testing.png" width="600" />
-</p>
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/jiwon-choi35/-Graph-Neural-Network-based-Multi-Currency-FX-Forecasting/feature/FinalMultisteps-dollarIndex/Cyber-trend-forecasting-main%203/AXIS/model/Bayesian/Testing/Kr_fx_Testing.png" width="600" />
-</p>
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/jiwon-choi35/-Graph-Neural-Network-based-Multi-Currency-FX-Forecasting/feature/FinalMultisteps-dollarIndex/Cyber-trend-forecasting-main%203/AXIS/model/Bayesian/Testing/Us_Trade%20Weighted%20Dollar%20Index_Testing.png" width="600" />
-</p>
-
-## Operational Model
-The script in the file **train.py** trains the final model on the full data using the optimal hyper-parameters stored in the file **hp.txt**. The output is the operational model called **model.pt**, which can be used to forecast the exchange rates and economic indicators. The operational model is saved in the directory **AXIS/model/Bayesian**. 
-
-## Future Forecast
-The script in the file **forecast.py** uses the operational model **model.pt** in the directory **AXIS/model/Bayesian** to produce forecasts for the exchange rates and economic indicators. The results include numerical forecasts of each node, stored in the directory **AXIS/model/Bayesian/forecast/data**. In addition, plots for the trends of exchange rates along with their related economic indicators are provided in the directory **AXIS/model/Bayesian/forecast/plots**. The plots visualize historical data alongside forecasted values, enabling analysis of projected trends.
-
-The numerical forecasts are saved in a structured format for further analysis and integration into downstream applications.
-
-Below is an example for the past and predicted future data for exchange rates and their pertinent economic indicators.
-
-<p align="center">
-  <img src="./AXIS/model/Bayesian/forecast/plots/Multi_Country_Forecast_Normalized.png" width="600" />
-</p>
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/jiwon-choi35/-Graph-Neural-Network-based-Multi-Currency-FX-Forecasting/feature/FinalMultisteps-dollarIndex/Cyber-trend-forecasting-main%203/AXIS/model/Bayesian/forecast/plots/us_Trade_Weighted_Dollar_Index.png" width="600" />
-</p>
+This project is provided for research and development purposes.
