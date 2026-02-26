@@ -55,8 +55,9 @@ The script `forecast.py` uses the trained model to generate:
 Below is an example of exchange rate forecasts with uncertainty quantification:
 
 <p align="center">
-<a href="url"><img src="./AXIS/model/Bayesian/forecast/plots/Multi_Country_Forecast_Normalized.png" align="centre"  width="600"   ></a>
+  <img src="./AXIS/model/Bayesian/forecast/plots/Multi_Country_Forecast_Normalized.png" width="600" />
 </p>
+
 
 ## Model Specifications
 
@@ -120,4 +121,5 @@ If you use this framework, please cite this work.
 ## License
 
 This project is provided for research and development purposes.
+
 
