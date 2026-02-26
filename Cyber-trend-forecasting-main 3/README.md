@@ -56,8 +56,3 @@ Below is an example for the past and predicted future data for exchange rates an
 <p align="center">
   <img src="./AXIS/model/Bayesian/forecast/plots/Multi_Country_Forecast_Normalized.png" width="600" />
 </p>
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/jiwon-choi35/-Graph-Neural-Network-based-Multi-Currency-FX-Forecasting/feature/FinalMultisteps-dollarIndex/Cyber-trend-forecasting-main%203/AXIS/model/Bayesian/forecast/plots/us_Trade_Weighted_Dollar_Index.png" width="600" />
-</p>
-
