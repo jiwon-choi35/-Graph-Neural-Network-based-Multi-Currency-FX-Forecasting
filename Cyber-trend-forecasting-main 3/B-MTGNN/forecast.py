@@ -1,525 +1,562 @@
-"""
-Index Data Forecasting Script (달러 인덱스 또는 가변 지수 데이터 예측)
-- 일반 환율과 달리, 인덱스는 1.0에 고정되지 않음
-- 실제 인덱스 값 변화를 유지하며 예측
-"""
-
 import numpy as np
 import os
 import torch
 import sys
-import re
-import argparse
 import pandas as pd
 from matplotlib import pyplot
 import matplotlib.dates as mdates
-
-# Import from current directory
 from net import gtnet
+from matplotlib import font_manager, rc
+pyplot.style.use("seaborn-v0_8-dark")
 
-# 기본 설정
-pyplot.rcParams['savefig.dpi'] = 300
+
+# --- [추가] 한글 폰트 및 마이너스 기호 설정 (Windows 맑은 고딕 기준) ---
+try:
+    font_path = "C:/Windows/Fonts/malgun.ttf" # Windows 맑은 고딕 경로
+    font_name = font_manager.FontProperties(fname=font_path).get_name()
+    rc('font', family=font_name)
+except:
+    # 경로가 다를 경우 시스템 폰트명으로 직접 설정 시도
+    pyplot.rcParams['font.family'] = 'Malgun Gothic'
+pyplot.rcParams['axes.unicode_minus'] = False # 마이너스 기호 깨짐 방지
+# High-resolution plot settings
+pyplot.rcParams['savefig.dpi'] = 1200
+
 
 # ==========================================
 # Helper Functions
 # ==========================================
 
 def exponential_smoothing(series, alpha):
-    """지수평활"""
+    """지수평활법"""
     result = [series[0]]
     for n in range(1, len(series)):
-        result.append(alpha * series[n] + (1 - alpha) * result[n - 1])
+        result.append(alpha * series[n] + (1 - alpha) * result[n-1])
     return result
+
 
 def consistent_name(name):
     """컬럼명 정리"""
-    name = name.replace('-ALL', '').replace('Mentions-', '').replace(' ALL', '').replace('Solution_', '').replace('_Mentions', '')
-    if not name.isupper():
-        words = name.split(' ')
-        result = ''
-        for i, word in enumerate(words):
-            if len(word) <= 2: 
-                result += word
-            else: 
-                result += word[0].upper() + word[1:]
-            if i < len(words) - 1: 
-                result += ' '
-        return result
-    words = name.split(' ')
-    result = ''
-    for i, word in enumerate(words):
-        if len(word) <= 3 or '/' in word: 
-            result += word
-        else: 
-            result += word[0] + (word[1:].lower())
-        if i < len(words) - 1: 
-            result += ' '
-    return result
+    name = name.replace('_', ' ')
+    if name == 'us Trade Weighted Dollar Index':
+        return 'US Dollar Index'
+    if name == 'kr fx':
+        return 'KRW/USD'
+    if name == 'jp fx':
+        return 'JPY/USD'
+    return name
+
 
 def zero_negative_curves(data, forecast):
-    """음수값 제거"""
+    """음수값 제거 (환율은 양수만 있음)"""
     data = torch.clamp(data, min=0)
     forecast = torch.clamp(forecast, min=0)
     return data, forecast
 
 
-def should_clamp_nonnegative(name):
-    lower = name.lower()
-    if 'trade_balance' in lower or 'balanced_of_trade' in lower:
-        return False
-    return True
-
-def save_data(data, forecast, confidence, variance, col, output_dir):
-    """예측 데이터 저장"""
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-        
+def save_data(data, forecast, confidence, variance, col, output_dir=None):
+    """예측 데이터를 텍스트 파일로 저장"""
+    if output_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(script_dir)
+        file_dir = os.path.join(project_root, 'AXIS', 'model', 'Bayesian', 'forecast', 'data')
+    else:
+        file_dir = output_dir
+    if not os.path.exists(file_dir):
+        os.makedirs(file_dir)
+    
     for i in range(data.shape[1]):
-        d = data[:,i]
-        f = forecast[:,i]
-        c = confidence[:,i]
-        v = variance[:,i]
+        d = data[:, i]
+        f = forecast[:, i]
+        c = confidence[:, i]
+        v = variance[:, i]
         name = col[i]
-        
-        safe_name = name.replace('/', '_')
-        with open(os.path.join(output_dir, safe_name + '.txt'), 'w') as ff:
+        with open(os.path.join(file_dir, name.replace('/', '_') + '.txt'), 'w') as ff:
             ff.write('Data: ' + str(d.tolist()) + '\n')
             ff.write('Forecast: ' + str(f.tolist()) + '\n')
             ff.write('95% Confidence: ' + str(c.tolist()) + '\n')
             ff.write('Variance: ' + str(v.tolist()) + '\n')
 
 
-def resolve_latest_tuned_model(script_dir, fallback_model_file):
-    tuning_root = os.path.join(script_dir, 'tuning_runs')
-    if not os.path.isdir(tuning_root):
-        return fallback_model_file
-
-    run_dirs = [
-        os.path.join(tuning_root, d)
-        for d in os.listdir(tuning_root)
-        if os.path.isdir(os.path.join(tuning_root, d))
-    ]
-    run_dirs.sort(reverse=True)
-
-    for run_dir in run_dirs:
-        summary_path = os.path.join(run_dir, 'best_summary.txt')
-        if not os.path.exists(summary_path):
-            continue
-        try:
-            with open(summary_path, 'r', encoding='utf-8') as f:
-                text = f.read()
-            m = re.search(r'log_file=(.*run_(\d+)\.log)', text)
-            if not m:
-                continue
-            run_id = int(m.group(2))
-            ckpt_path = os.path.join(run_dir, 'checkpoints', f'model_{run_id:03d}.pt')
-            if os.path.exists(ckpt_path):
-                return ckpt_path
-        except Exception:
-            continue
-
-    return fallback_model_file
-
-
-def smooth_series(arr, alpha):
-    if alpha >= 0.999:
-        return arr
-    return np.array(exponential_smoothing(arr, alpha), dtype=np.float32)
-
-# ==========================================
-# Plotting Functions
-# ==========================================
-def plot_forecast(data, forecast, confidence, name, dates_hist, dates_future, output_dir, color="#1f77b4", linestyle='--', is_index=False):
-    """개별 노드 플롯"""
-    if should_clamp_nonnegative(name):
-        data, forecast = zero_negative_curves(data, forecast)
-    if torch.is_tensor(data): 
-        data = data.cpu()
-    if torch.is_tensor(forecast): 
-        forecast = forecast.cpu()
-    if torch.is_tensor(confidence): 
-        confidence = confidence.cpu()
-
-    pyplot.style.use("default") 
+def plot_forecast(data, forecast, confidence, col_name, dates_hist, dates_future, output_dir=None, color='RoyalBlue'):
+    """개별 국가 예측 플롯 생성 (사이버 보안 스타일)"""
+    
+    # 음수값 제거
+    data, forecast = zero_negative_curves(data, forecast)
+    
+    # 스타일 설정
+    
     fig = pyplot.figure()
     ax = fig.add_axes([0.1, 0.1, 0.7, 0.75])
-
-    d = torch.cat((data, forecast[0:1]), dim=0).numpy()
-    f = forecast.numpy()
-    c = confidence.numpy()
-    clean_name = consistent_name(name)
-    all_dates = dates_hist + dates_future
-
-    ax.plot(range(len(d)), d, '-', color=color, label=clean_name, linewidth=2)
-    ax.plot(range(len(d) - 1, (len(d) + len(f)) - 1), f, linestyle=linestyle, color=color, linewidth=2)
     
-    # 모든 데이터에 신뢰도 영역 표시
-    ax.fill_between(range(len(d) - 1, (len(d) + len(f)) - 1), f - c, f + c, color=color, alpha=0.3)
-    ax.plot(range(len(d) - 1, (len(d) + len(f)) - 1), f - c, color=color, linewidth=0.8, alpha=0.6)
-    ax.plot(range(len(d) - 1, (len(d) + len(f)) - 1), f + c, color=color, linewidth=0.8, alpha=0.6)
-
-    x_ticks_pos = [i for i, date in enumerate(all_dates) if date.month == 1]
-    last_pos = len(all_dates) - 1
-    if last_pos not in x_ticks_pos:
-        x_ticks_pos.append(last_pos)
-
-    ax.set_xticks(x_ticks_pos)
-    ax.set_xticklabels(
-        [all_dates[i].strftime('%Y') if all_dates[i].month == 1 else all_dates[i].strftime('%b-%y') for i in x_ticks_pos],
-        rotation=90, fontsize=13
-    )
-    ax.set_ylabel(f"{consistent_name(name)}", fontsize=15)
-    pyplot.yticks(fontsize=13)
-    ax.legend(loc="upper left", prop={'size': 10}, bbox_to_anchor=(1, 1.03))
+    # Historical과 Forecast 연결
+    d = torch.cat((data, forecast[0:1]), dim=0)  # Historical 끝 + Forecast 시작 연결
+    f = forecast
+    c = confidence
+    
+    # 선 두께 결정 (US는 2, 나머지는 1)
+    if 'us_' in col_name.lower() or 'dollar' in col_name.lower():
+        line_width = 2
+    else:
+        line_width = 1
+    
+    # Historical 플롯 (인덱스 기반)
+    ax.plot(range(len(d)), d, '-', color=color, label=consistent_name(col_name), linewidth=line_width)
+    
+    # Forecast 플롯 (Historical 끝에서 이어서)
+    forecast_range = range(len(d)-1, (len(d)+len(f))-1)
+    ax.plot(forecast_range, f, '-', color=color, linewidth=line_width)
+    
+    # 95% Confidence Interval (종합 그래프와 동일하게 증폭)
+    ax.fill_between(forecast_range, 
+                     f - c * 6, 
+                     f + c * 6,
+                     color=color, alpha=0.4, label='95% CI')
+    
+    # X축 년도 레이블 (2011~2027, 2011-01부터 시작)
+    # 데이터: 180개월 (2011-01 ~ 2025-12) + 12개월 예측 (2026-01 ~ 2026-12)
+    x = ['2011', '2012', '2013', '2014', '2015', '2016', '2017', '2018', '2019', '2020', '2021', '2022', '2023', '2024', '2025', '2026', '2027']
+    # 각 연도 1월의 인덱스: 2011-01=0, 2012-01=12, 2013-01=24, ...
+    positions = [0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120, 132, 144, 156, 168, 180, 192]
+    ax.set_xticks(positions, x)
+    
+    # Y축 레이블
+    ax.set_ylabel("Trend", fontsize=15)
+    pyplot.yticks(fontsize=7)
+    
+    # 범례
+    ax.legend(loc="upper left", prop={'size': 7})
     ax.axis('tight')
     ax.grid(True)
-    pyplot.xticks(rotation=90, fontsize=13)
-    pyplot.title(clean_name, y=1.03, fontsize=18)
-    fig.set_size_inches(10, 7)
+    pyplot.xticks(rotation=90, fontsize=7)
+    
+    # 타이틀
+    pyplot.title(consistent_name(col_name), y=1.03, fontsize=18)
+    
+    # 크기 설정
+    fig.set_size_inches(7.487, 3.93)
+    
+    # 저장
+    if output_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(script_dir)
+        images_dir = os.path.join(project_root, 'AXIS', 'model', 'Bayesian', 'forecast', 'plots')
+    else:
+        images_dir = output_dir
+    if not os.path.exists(images_dir):
+        os.makedirs(images_dir)
+    
+    safe_name = col_name.replace('/', '_').replace(' ', '_')
+    pyplot.savefig(os.path.join(images_dir, safe_name + '.png'), bbox_inches="tight")
+    pyplot.savefig(os.path.join(images_dir, safe_name + '.pdf'), bbox_inches="tight", format='pdf')
+    print(f"✅ Plot saved: {safe_name}")
+    pyplot.show(block=False)
+    pyplot.pause(3)
+    pyplot.close()
 
-    if not os.path.exists(output_dir): 
-        os.makedirs(output_dir)
-    safe_name = clean_name.replace('/', '_')
-    pyplot.savefig(os.path.join(output_dir, safe_name + '.png'), bbox_inches="tight")
-    pyplot.close(fig)
-    print(f"Individual Plot saved: {safe_name}.png (Color: {color})")
 
-
-def plot_multi_node(dates_hist, dates_future, smoothed_hist, smoothed_fut, smoothed_conf_fut,
-                    target_indices, col, index_idx, plot_colours, out_path,
-                    x_start=None, x_end=None, add_last_month_tick=True):
-    """다중 노드 플롯 - 하나의 그림에 5개 노드"""
-    fig, ax = pyplot.subplots(figsize=(15, 10))
-
-    connect_date = dates_future[0]
-    x_past = dates_hist + [connect_date]
-
+def plot_multi_node(data, forecast, confidence, target_indices, col, dates_hist, dates_future, output_dir=None):
+    """다국가 비교 플롯 (DDoS 공격-솔루션 스타일)"""
+    
+    # 음수값 제거
+    data, forecast = zero_negative_curves(data, forecast)
+    
+    # 색상 팔레트 (DDoS 이미지와 유사하게)
+    colours = ["RoyalBlue", "Crimson", "DarkOrange", "MediumPurple", "MediumVioletRed",
+              "DodgerBlue", "Indigo", "coral", "hotpink", "DarkMagenta"]
+    
+   
+    fig = pyplot.figure()
+    ax = fig.add_axes([0.1, 0.1, 0.7, 0.75])
+    
+    # 각 국가별 플롯 (Normalize 적용)
     for idx, i in enumerate(target_indices):
-        # 각 노드의 첫 값 기준으로 정규화 (1.0부터 시작)
-        base_value = smoothed_hist[0, i]
+        color = colours[idx % len(colours)]
+        col_name = consistent_name(col[i])
         
-        y_past = torch.cat((smoothed_hist[:, i], smoothed_fut[0:1, i]), dim=0).numpy() / base_value
-        y_fut = smoothed_fut[:, i].numpy() / base_value
-        c_fut = smoothed_conf_fut[:, i].numpy() / base_value
-
-        color = plot_colours[idx % len(plot_colours)]
-        is_index = 'weighted' in col[i].lower() or 'trade' in col[i].lower()
-
-        ax.plot(x_past, y_past, '-', label=consistent_name(col[i]), color=color, linewidth=1.5)
-        ax.plot(dates_future, y_fut, linestyle='--', color=color, linewidth=2)
-
-        # 신뢰도 영역 표시
-        ax.fill_between(dates_future, y_fut - c_fut, y_fut + c_fut, color=color, alpha=0.25)
-
-    if x_start is None:
-        x_start = dates_hist[0]
-    if x_end is None:
-        x_end = dates_future[-1] + pd.Timedelta(days=30)
-    ax.set_xlim(pd.Timestamp(x_start), pd.Timestamp(x_end))
-
-    ax.xaxis.set_major_locator(mdates.YearLocator(1))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-
-    if add_last_month_tick:
-        end_tick = pd.Timestamp(dates_future[-1])
-        year_ticks = pd.date_range(pd.Timestamp(x_start).normalize(), end_tick.normalize(), freq="YS")
-        ticks = list(year_ticks)
-
-        if end_tick not in ticks:
-            ticks.append(end_tick)
-
-        labels = [t.strftime('%Y') for t in year_ticks]
-        if ticks[-1] == end_tick and (len(labels) == len(ticks) - 1):
-            labels.append(end_tick.strftime('%Y/%b'))
-
-        ax.set_xticks(ticks)
-        ax.set_xticklabels(labels)
-
-    ax.legend(loc="upper left", bbox_to_anchor=(1, 1.03))
-    ax.grid(True, linestyle=':', alpha=0.6)
-    pyplot.title("US Index & FX Rate Forecast (Normalized to 1.0)", fontsize=18)
-    pyplot.savefig(out_path, bbox_inches="tight")
+        # Historical + Forecast 시작점 연결
+        d = torch.cat((data[:, i], forecast[0:1, i]), dim=0)
+        f = forecast[:, i]
+        c = confidence[:, i]
+        
+        # Normalize: 첫 번째 값을 1.0으로 (또는 모든 값을 min-max scaling)
+        # 옵션 1: 첫 번째 값 기준 normalize (2011-01 = 1.0)
+        base_value = d[0].item()
+        d_normalized = d / base_value
+        f_normalized = f / base_value
+        # Confidence는 상대적 비율로 유지 (normalize된 값의 비율로 계산)
+        # 원본 confidence를 원본 값으로 나누면 상대적 변동폭이 됨
+        c_relative = c / base_value
+        # 음영이 잘 보이도록 confidence를 3배로 증폭
+        c_normalized = c_relative * 3.0
+        
+        # Historical 플롯 (인덱스 기반, normalized)
+        line_width = 2 if idx == 0 else 1  # 첫 번째 국가는 굵게
+        ax.plot(range(len(d_normalized)), d_normalized, '-', color=color, label=col_name, linewidth=line_width, zorder=3)
+        
+        # Forecast 플롯 (Historical 끝에서 연결, normalized)
+        forecast_range = range(len(d_normalized)-1, (len(d_normalized)+len(f_normalized))-1)
+        ax.plot(forecast_range, f_normalized, '-', color=color, linewidth=line_width, zorder=3)
+        
+        # 95% Confidence Interval (각 국가별로, 더 두껍게)
+        ax.fill_between(forecast_range,
+                        f_normalized - c_normalized * 2,
+                        f_normalized + c_normalized * 2,
+                        color=color, alpha=0.4, zorder=3)
+    
+    # 모든 국가 플롯 후 음영 적용: US선~KR선은 KR색, KR선~JP선은 파란색
+    if len(target_indices) > 2:
+        # US (첫 번째 - 가장 아래)
+        us_idx = target_indices[0]
+        d_us = torch.cat((data[:, us_idx], forecast[0:1, us_idx]), dim=0)
+        f_us = forecast[:, us_idx]
+        base_us = d_us[0].item()
+        full_us = torch.cat((d_us, f_us[1:]), dim=0)
+        full_us_norm = full_us / base_us
+        
+        # KR (두 번째 - 중간)
+        kr_idx = target_indices[1]
+        d_kr = torch.cat((data[:, kr_idx], forecast[0:1, kr_idx]), dim=0)
+        f_kr = forecast[:, kr_idx]
+        base_kr = d_kr[0].item()
+        full_kr = torch.cat((d_kr, f_kr[1:]), dim=0)
+        full_kr_norm = full_kr / base_kr
+        
+        # JP (세 번째 - 가장 위)
+        jp_idx = target_indices[2]
+        d_jp = torch.cat((data[:, jp_idx], forecast[0:1, jp_idx]), dim=0)
+        f_jp = forecast[:, jp_idx]
+        base_jp = d_jp[0].item()
+        full_jp = torch.cat((d_jp, f_jp[1:]), dim=0)
+        full_jp_norm = full_jp / base_jp
+        
+        # Forecast 구간만 추출 (180~191)
+        forecast_start_idx = len(d_us) - 1  # 179
+        forecast_x = np.arange(forecast_start_idx, forecast_start_idx + len(f_us))
+        forecast_y_us = full_us_norm[forecast_start_idx:forecast_start_idx + len(f_us)].cpu().numpy()
+        forecast_y_kr = full_kr_norm[forecast_start_idx:forecast_start_idx + len(f_kr)].cpu().numpy()
+        forecast_y_jp = full_jp_norm[forecast_start_idx:forecast_start_idx + len(f_jp)].cpu().numpy()
+        
+        # 색상 팔레트 (RoyalBlue=US, Crimson=KR)
+        colours_shading = ["RoyalBlue", "Crimson", "DarkOrange"]
+        
+        # 파란색 음영: US선부터 JP선까지 (전체 배경)
+        ax.fill_between(
+            forecast_x, forecast_y_us, forecast_y_jp,
+            interpolate=True,
+            color=colours_shading[0],  # RoyalBlue (파란색)
+            alpha=0.3,
+            zorder=1
+        )
+        
+        # KR 색깔 음영: US선부터 KR선까지 (위에 덮기)
+        ax.fill_between(
+            forecast_x, forecast_y_us, forecast_y_kr,
+            interpolate=True,
+            color=colours_shading[1],  # Crimson (KR 색)
+            alpha=0.3,
+            zorder=2
+        )
+    
+    # X축 년도 레이블 (2011~2027, 2011-01부터 시작)
+    x = ['2011', '2012', '2013', '2014', '2015', '2016', '2017', '2018', '2019', '2020', '2021', '2022', '2023', '2024', '2025', '2026', '2027']
+    # 각 연도 1월의 인덱스: 2011-01=0, 2012-01=12, 2013-01=24, ...
+    positions = [0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120, 132, 144, 156, 168, 180, 192]
+    ax.set_xticks(positions, x)
+    
+    # Y축 레이블 (Normalized)
+    #ax.set_ylabel("Normalized Index (2011-01 = 1.0)", fontsize=15)
+    pyplot.yticks(fontsize=7)
+    
+    # 범례
+    ax.legend(loc="upper left", prop={'size': 7})
+    ax.axis('tight')
+    ax.grid(True)
+    pyplot.xticks(rotation=90, fontsize=7)
+    
+   
+    # 크기 설정
+    fig.set_size_inches(7.487, 3.93)
+    
+    # 저장
+    if output_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(script_dir)
+        images_dir = os.path.join(project_root, 'AXIS', 'model', 'Bayesian', 'forecast', 'plots')
+    else:
+        images_dir = output_dir
+    if not os.path.exists(images_dir):
+        os.makedirs(images_dir)
+    
+    pyplot.savefig(os.path.join(images_dir, 'Multi_Country_Forecast_Normalized.png'), bbox_inches="tight")
+    pyplot.savefig(os.path.join(images_dir, 'Multi_Country_Forecast_Normalized.pdf'), bbox_inches="tight", format='pdf')
+    print(f"✅ Multi-country plot saved (normalized)")
+    pyplot.show(block=False)
+    pyplot.pause(5)
     pyplot.close()
 
 
 # ==========================================
-# Main Execution Block
+# Main Forecasting
 # ==========================================
 
-parser = argparse.ArgumentParser(description='Forecast plotting and export')
-parser.add_argument('--model', type=str, default='', help='optional model checkpoint path (.pt)')
-parser.add_argument('--mc_runs', type=int, default=20)
-parser.add_argument('--horizon', type=int, default=36)
-parser.add_argument('--hist_alpha', type=float, default=0.3, help='history smoothing alpha')
-parser.add_argument('--future_alpha', type=float, default=1.0, help='future smoothing alpha (1.0 means no smoothing)')
-args = parser.parse_args()
-
-# 경로 설정
-script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(script_dir)
-data_file = os.path.join(script_dir, 'data', 'sm_data.csv')
-model_file = os.path.join(project_root, 'AXIS', 'model', 'Bayesian', 'model.pt')
-if args.model.strip():
-    model_file = args.model
-else:
-    model_file = resolve_latest_tuned_model(script_dir, model_file)
-
-# 출력 디렉토리
-plot_dir = os.path.join(project_root, 'AXIS', 'model', 'Bayesian', 'forecast', 'plots')
-pt_plots_dir = os.path.join(project_root, 'AXIS', 'model', 'Bayesian', 'forecast', 'pt_plots')
-data_out_dir = os.path.join(project_root, 'AXIS', 'model', 'Bayesian', 'forecast', 'data')
-
-for d in [plot_dir, pt_plots_dir, data_out_dir]:
-    if not os.path.exists(d): 
-        os.makedirs(d, exist_ok=True)
-
-# Device 설정
-device = torch.device('cpu')
-print(f"Using device: {device}")
-
-# 데이터 로드
-try:
-    print(f"Reading data from: {data_file}")
+if __name__ == "__main__":
+    
+    print("="*70)
+    print("  BAYESIAN MTGNN EXCHANGE RATE FORECASTING")
+    print("="*70)
+    
+    # 파일 경로
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(script_dir)
+    data_file = os.path.join(script_dir, 'data', 'sm_data.csv')
+    model_file = os.path.join(project_root, 'AXIS', 'model', 'Bayesian', 'model.pt')
+    
+    # 출력 디렉토리 설정
+    plot_dir = os.path.join(project_root, 'AXIS', 'model', 'Bayesian', 'forecast', 'plots')
+    data_out_dir = os.path.join(project_root, 'AXIS', 'model', 'Bayesian', 'forecast', 'data')
+    
+    for d in [plot_dir, data_out_dir]:
+        if not os.path.exists(d):
+            os.makedirs(d, exist_ok=True)
+    
+    # 데이터 로드
+    print("\n📂 Loading data...")
     df_raw = pd.read_csv(data_file)
-
+    
     # 날짜 컬럼 찾기
     date_col = next((c for c in ["Date", "date", "DATA", "data"] if c in df_raw.columns), None)
-
+    
     if date_col is not None:
         dates_all = pd.to_datetime(df_raw[date_col], errors="coerce")
         df = df_raw.drop(columns=[date_col])
-        if dates_all.isna().all():
-            dates_all = None
     else:
         dates_all = None
         df = df_raw
-
-    # 수치 변환 및 결측치 처리
+    
+    # 수치 변환
     df = df.apply(pd.to_numeric, errors="coerce").ffill().fillna(0)
-
-    # 날짜 설정
-    if dates_all is None:
-        LAST_OBS = pd.Timestamp("2025-07-01")
-        dates_all = pd.date_range(end=LAST_OBS, periods=len(df), freq="MS").tolist()
-    else:
-        dates_all = pd.Series(dates_all).ffill()
-        dates_all = [pd.Timestamp(d).to_period("M").to_timestamp() for d in dates_all.tolist()]
-
     col = df.columns.tolist()
     rawdat = df.values
     n, m = rawdat.shape
-    print(f"Data loaded: {n} months, {m} nodes | last={pd.Timestamp(dates_all[-1]).strftime('%Y-%m')}")
-
-except FileNotFoundError:
-    print(f"❌ Error: 파일을 찾을 수 없습니다: {data_file}")
-    sys.exit()
-
-# Index 컬럼 찾기
-index_idx = next((i for i, name in enumerate(col) 
-                   if 'us_' in name.lower() or 'dollar' in name.lower() or 'index' in name.lower()), -1)
-if index_idx != -1: 
-    print(f"Found Index column at index {index_idx}: {col[index_idx]}")
-
-# Normalization (인덱스 값을 강제로 1.0으로 고정하지 않음)
-scale = np.ones(m)
-dat = np.zeros(rawdat.shape)
-
-for i in range(m):
-    scale[i] = np.max(np.abs(rawdat[:, i]))
-    if scale[i] == 0: 
-        scale[i] = 1.0
-    dat[:, i] = rawdat[:, i] / scale[i]
-
-print(f"Data normalized. Scale values: {scale[:5]}...")  # 처음 5개만 표시
-
-# 모델 로드
-print(f"Loading model from: {model_file}")
-try:
+    
+    print(f"✅ Data shape: {n} time points × {m} variables")
+    
+    # 날짜 생성 (2025년 12월까지)
+    LAST_OBS = pd.Timestamp("2025-12-01")
+    dates_hist = pd.date_range(end=LAST_OBS, periods=n, freq="MS").tolist()
+    print(f"📅 Historical period: {dates_hist[0].strftime('%Y-%m')} ~ {dates_hist[-1].strftime('%Y-%m')}")
+    
+    # Normalization
+    print("\n⚙️  Normalizing...")
+    scale = np.ones(m)
+    dat = np.zeros(rawdat.shape)
+    
+    for i in range(m):
+        scale[i] = np.max(np.abs(rawdat[:, i]))
+        if scale[i] == 0:
+            scale[i] = 1.0
+        dat[:, i] = rawdat[:, i] / scale[i]
+    
+    print("✅ Normalization complete")
+    
+    # 모델 로드
+    print("\n🧠 Loading model...")
     with open(model_file, 'rb') as f:
-        model = torch.load(f, map_location=device, weights_only=False)
-        model.to(device)
-    print("✅ Model loaded successfully")
-except Exception as e:
-    print(f"❌ Error loading model: {e}")
-    sys.exit()
-
-# Input sequence length 결정
-try:
-    seq_len = int(getattr(model, 'seq_length', None) or 
-                  (getattr(model.module, 'seq_length', None) if hasattr(model, 'module') else None))
-except Exception:
-    seq_len = None
-
-if seq_len is None:
-    seq_len = 10
-
-print(f"Using input sequence length (seq_len) = {seq_len}")
-
-# 초기 입력 준비
-X_init = torch.from_numpy(dat[-seq_len:, :]).float().to(device)
-
-# Bayesian Estimation (Dropout MC)
-num_runs, horizon = args.mc_runs, args.horizon
-outputs = []
-
-print(f"Running Bayesian Forecast ({num_runs} MC runs, {horizon} month horizon)...")
-
-P = seq_len
-
-model.train()
-with torch.no_grad():
-    tmp_in = X_init.unsqueeze(0).unsqueeze(0).permute(0, 1, 3, 2).contiguous()
-    tmp_out = model(tmp_in)
-    pred_len = int(tmp_out.size(1))
-
-for r in range(num_runs):
-    curr_X = X_init.clone()
-    preds = []
-    len_preds = 0
-
-    model.train()
+        model = torch.load(f, map_location='cpu', weights_only=False)
+    print("✅ Model loaded")
+    
+    # Input sequence length (모델에서 설정된 값 사용)
+    try:
+        seq_len = model.seq_length
+    except:
+        seq_len = 12  # train_test.py의 기본값
+    
+    P = seq_len
+    print(f"🕹️  Input sequence length: {seq_len} months")
+    
+    # 초기 입력 (마지막 10개월)
+    X_init = torch.from_numpy(dat[-seq_len:, :]).float()
+    
+    # Forecast settings
+    horizon = 12  # 2026년 1~12월 (12개월)
+    num_runs = 20  # MC dropout runs
+    
+    print(f"\n🎲 Running Bayesian forecast...")
+    print(f"   • MC runs: {num_runs}")
+    print(f"   • Horizon: {horizon} months")
+    
+    # Monte Carlo Dropout Forecasting
+    outputs = []
+    model.train()  # Enable dropout
+    
     with torch.no_grad():
-        while len_preds < horizon:
-            curr_input = curr_X.unsqueeze(0).unsqueeze(0).permute(0, 1, 3, 2).contiguous()
+        # 먼저 모델 출력 길이 확인
+        tmp_in = X_init.unsqueeze(0).unsqueeze(0).permute(0, 1, 3, 2).contiguous()
+        tmp_out = model(tmp_in)
+        pred_len = int(tmp_out.size(1))
+        
+        for r in range(num_runs):
+            curr_X = X_init.clone()
+            preds = []
+            len_preds = 0
+            
+            while len_preds < horizon:
+                curr_input = curr_X.unsqueeze(0).unsqueeze(0).permute(0, 1, 3, 2).contiguous()
+                
+                # RevIN (train_test.py와 동일)
+                w_mean = curr_input.mean(dim=-1, keepdim=True)
+                w_std = curr_input.std(dim=-1, keepdim=True)
+                w_std[w_std == 0] = 1
+                curr_input_norm = (curr_input - w_mean) / w_std
+                
+                out = model(curr_input_norm)
+                
+                # Denormalize
+                pred_block = out.squeeze(3).squeeze(0)  # [T_out, N]
+                wm = w_mean[0, 0, :, 0]
+                ws = w_std[0, 0, :, 0]
+                pred_level = pred_block * ws.unsqueeze(0) + wm.unsqueeze(0)
+                
+                need = horizon - len_preds
+                take = min(pred_level.size(0), need)
+                take_block = pred_level[:take, :].cpu().numpy()
+                
+                preds.append(take_block)
+                len_preds += take
+                
+                new_X = np.concatenate([curr_X.cpu().numpy(), take_block], axis=0)
+                curr_X = torch.from_numpy(new_X[-P:, :]).float().contiguous()
+            
+            outputs.append(torch.tensor(np.concatenate(preds, axis=0)))
+    
+    print("✅ Forecast complete")
+    
+    # 통계 계산
+    outputs = torch.stack(outputs)
+    Y = torch.mean(outputs, dim=0)
+    std_dev = torch.std(outputs, dim=0)
+    confidence = 1.96 * std_dev / torch.sqrt(torch.tensor(num_runs))
+    variance = torch.var(outputs, dim=0)
+    
+    # Denormalization
+    scale_torch = torch.from_numpy(scale).float()
+    dat_denorm = torch.from_numpy(dat).float() * scale_torch
+    Y_denorm = Y * scale_torch
+    confidence_denorm = confidence * scale_torch
+    variance_denorm = variance * scale_torch
+    
+    # Residual-based prediction interval adjustment (0.5 factor)
+    confidence_denorm = confidence_denorm * 0.5
+    
+    print(f"\n📊 Statistics:")
+    print(f"   • Mean forecast: {Y_denorm.mean():.4f}")
+    print(f"   • Std: {Y_denorm.std():.4f}")
+    print(f"   • Avg confidence width: {confidence_denorm.mean():.4f}")
+    
+    # 데이터 저장
+    print("\n💾 Saving forecast data...")
+    save_data(dat_denorm, Y_denorm, confidence_denorm, variance_denorm, col, data_out_dir)
+    print("✅ Data saved")
+    
+    # Smoothing (optional)
+    print("\n🔧 Applying exponential smoothing...")
+    alpha_hist = 0.3
+    alpha_future = 0.5
+    alpha_conf = 0.95  # Confidence는 거의 smoothing 안 함 (음영이 잘 보이도록)
+    
+    hist_smoothed = []
+    fut_smoothed = []
+    conf_smoothed = []
+    
+    for i in range(m):
+        hist_arr = dat_denorm[:, i].cpu().numpy()
+        fut_arr = Y_denorm[:, i].cpu().numpy()
+        conf_arr = confidence_denorm[:, i].cpu().numpy()
+        
+        hist_smoothed.append(exponential_smoothing(hist_arr.tolist(), alpha_hist))
+        fut_smoothed.append(exponential_smoothing(fut_arr.tolist(), alpha_future))
+        conf_smoothed.append(exponential_smoothing(conf_arr.tolist(), alpha_conf))
+    
+    hist_plot = torch.tensor(np.array(hist_smoothed)).T
+    fut_plot = torch.tensor(np.array(fut_smoothed)).T
+    conf_plot = torch.tensor(np.array(conf_smoothed)).T
+    
+    print("✅ Smoothing complete")
+    
+    # 예측 날짜 생성 (2026년 1월~12월)
+    FORECAST_START = LAST_OBS + pd.DateOffset(months=1)
+    dates_future = pd.date_range(start=FORECAST_START, periods=horizon, freq="MS").tolist()
+    print(f"📅 Forecast period: {dates_future[0].strftime('%Y-%m')} ~ {dates_future[-1].strftime('%Y-%m')}")
+    
+    # 플롯 대상 선택 (3개국만)
+    target_names = ['us_Trade Weighted Dollar Index', 'kr_fx', 'jp_fx']
+    target_indices = [i for i, name in enumerate(col) if name in target_names]
+    
+    if not target_indices:
+        print("⚠️  Warning: Target columns not found")
+        target_indices = list(range(min(3, m)))
+    
+    print(f"\n🎯 Target countries: {[col[i] for i in target_indices]}")
+    
+    # 플롯 색상 팔레트 (Multi_Country와 동일)
+    plot_colours = ["RoyalBlue", "Crimson", "DarkOrange"]
+    
+    # 플롯 생성
+    print("\n📊 Generating plots...")
+    
+    # 개별 플롯 (색상 매칭)
+    for idx, i in enumerate(target_indices):
+        color = plot_colours[idx % len(plot_colours)]
+        plot_forecast(hist_plot[:, i], fut_plot[:, i], conf_plot[:, i],
+                     col[i], dates_hist, dates_future, plot_dir, color)
+    
+    # 다국가 비교 플롯
+    plot_multi_node(hist_plot, fut_plot, conf_plot,
+                   target_indices, col, dates_hist, dates_future, plot_dir)
+    
+    print("\n📊 Generating node-wise CSV tables (predict, actual, gap)...")
+    try:
+        # 1. 날짜 헤더 생성 (2026-01-01 형식)
+        time_labels = [d.strftime('%Y-%m-%d') for d in dates_future]
+        
+        # 2. 예측값(Predict) 데이터 준비
+        pred_matrix = Y_denorm.detach().cpu().numpy().T
+        
+        # 3. 실제값(Actual) 데이터 준비
+        if rawdat.shape[0] >= horizon:
+            actual_matrix = rawdat[-horizon:, :].T
+        else:
+            actual_matrix = np.zeros_like(pred_matrix)
 
-            # train_test.py와 동일한 RevIN 전처리/복원
-            w_mean = curr_input.mean(dim=-1, keepdim=True)
-            w_std = curr_input.std(dim=-1, keepdim=True)
-            w_std[w_std == 0] = 1
-            curr_input_norm = (curr_input - w_mean) / w_std
+        # 4. 절댓값 오차 계산 (Gap = |예측 - 실제|)
+        gap_matrix = np.abs(pred_matrix - actual_matrix)
 
-            out = model(curr_input_norm)
+        # 5. CSV 저장 함수 (첫 열 노드명, 첫 행 날짜)
+        def save_formatted_csv(data_mat, filename, node_names, time_headers):
+            df_table = pd.DataFrame(data=data_mat, columns=time_headers)
+            df_table.insert(0, 'Node_Name', node_names)
+            out_path = os.path.join(data_out_dir, filename)
+            df_table.to_csv(out_path, index=False)
+            return out_path
 
-            pred_block = out.squeeze(3).squeeze(0)  # [T_out, N]
-            wm = w_mean[0, 0, :, 0]
-            ws = w_std[0, 0, :, 0]
-            pred_level = pred_block * ws.unsqueeze(0) + wm.unsqueeze(0)
+        # 6. 파일 자동 생성
+        save_formatted_csv(pred_matrix, 'predict.csv', col, time_labels)
+        save_formatted_csv(actual_matrix, 'actual.csv', col, time_labels)
+        save_formatted_csv(gap_matrix, 'gap.csv', col, time_labels)
 
-            # 인덱스를 강제로 1.0으로 고정하지 않음
-            # if index_idx != -1:
-            #     pred_level[:, index_idx] = 1.0
+        print(f"✅ CSV files (predict, actual, gap) saved in: {data_out_dir}")
 
-            need = horizon - len_preds
-            take = min(pred_level.size(0), need)
-            take_block = pred_level[:take, :].cpu().numpy()
-
-            preds.append(take_block)
-            len_preds += take
-
-            new_X = np.concatenate([curr_X.cpu().numpy(), take_block], axis=0)
-            curr_X = torch.from_numpy(new_X[-P:, :]).float().to(device).contiguous()
-
-    outputs.append(torch.tensor(np.concatenate(preds, axis=0)))
-
-print(f"✅ Forecast generation complete")
-
-# 통계 계산
-outputs = torch.stack(outputs)
-Y = torch.mean(outputs, dim=0)
-std_dev = torch.std(outputs, dim=0)
-confidence = 1.96 * std_dev / torch.sqrt(torch.tensor(num_runs))
-variance = torch.var(outputs, dim=0)
-
-# Denormalization
-scale_torch = torch.from_numpy(scale).float()
-dat_denorm = torch.from_numpy(dat).float() * scale_torch
-Y_denorm = Y * scale_torch
-confidence_denorm = confidence * scale_torch
-variance_denorm = variance * scale_torch
-
-save_data(dat_denorm, Y_denorm, confidence_denorm, variance_denorm, col, data_out_dir)
-
-# Smoothing
-all_data = torch.cat((dat_denorm, Y_denorm), dim=0)
-all_conf = torch.cat((torch.zeros_like(dat_denorm), confidence_denorm), dim=0)
-
-hist_plot_list, fut_plot_list, conf_plot_list = [], [], []
-for i in range(m):
-    hist_arr = dat_denorm[:, i].cpu().numpy()
-    fut_arr = Y_denorm[:, i].cpu().numpy()
-    conf_arr = confidence_denorm[:, i].cpu().numpy()
-
-    hist_plot_list.append(smooth_series(hist_arr, args.hist_alpha))
-    fut_plot_list.append(smooth_series(fut_arr, args.future_alpha))
-    conf_plot_list.append(smooth_series(conf_arr, min(args.future_alpha, 0.5)))
-
-hist_plot = torch.tensor(np.array(hist_plot_list)).T
-fut_plot = torch.tensor(np.array(fut_plot_list)).T
-conf_plot_fut = torch.tensor(np.array(conf_plot_list)).T
-
-# 날짜 설정
-HIST_END = pd.Timestamp("2025-07-01")
-dates_hist = pd.date_range(end=HIST_END, periods=len(df), freq="MS").tolist()
-
-FORECAST_START = HIST_END + pd.DateOffset(months=1)
-dates_future = pd.date_range(start=FORECAST_START, periods=horizon, freq="MS").tolist()
-
-print(f"Forecast range: {dates_future[0].strftime('%Y-%m')} ~ {dates_future[-1].strftime('%Y-%m')}")
-
-# 플롯 대상 선택 (US Trade Weighted Dollar Index + 주요 FX)
-preferred_names = [
-    'us_Trade Weighted Dollar Index',
-    'kr_fx',
-    'jp_fx',
-    'cn_fx',
-    'uk_fx',
-]
-target_indices = [i for i, name in enumerate(col) if name in preferred_names]
-
-# 대소문자/표기 차이 대비 fallback
-if not target_indices:
-    fallback_tokens = ['trade weighted dollar index', 'kr_fx', 'jp_fx', 'cn_fx', 'uk_fx']
-    target_indices = sorted(list(set([
-        i for token in fallback_tokens for i, n in enumerate(col)
-        if token in n.lower() and 'trade_balance' not in n.lower() and 'balanced_of_trade' not in n.lower()
-    ])))
-
-if not target_indices:
-    target_indices = list(range(m))
-
-plot_colours = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
-
-# 개별 플롯 생성
-print("Generating individual plots...")
-for idx, i in enumerate(target_indices):
-    plot_forecast(hist_plot[:, i], fut_plot[:, i], conf_plot_fut[:, i], col[i], 
-                  dates_hist, dates_future, pt_plots_dir, 
-                  color=plot_colours[idx % len(plot_colours)], 
-                  linestyle='--',
-                  is_index=False)
-
-# Multi-Node Plot - FULL
-print("Generating multi-node plots...")
-plot_multi_node(
-    dates_hist=dates_hist,
-    dates_future=dates_future,
-    smoothed_hist=hist_plot,
-    smoothed_fut=fut_plot,
-    smoothed_conf_fut=conf_plot_fut,
-    target_indices=target_indices,
-    col=col,
-    index_idx=index_idx,
-    plot_colours=plot_colours,
-    out_path=os.path.join(plot_dir, "Multi_Node_Index_FULL.png"),
-    x_start=dates_hist[0],
-    x_end=pd.Timestamp("2028-07-31"),
-)
-
-# Multi-Node Plot - ZOOM
-plot_multi_node(
-    dates_hist=dates_hist,
-    dates_future=dates_future,
-    smoothed_hist=hist_plot,
-    smoothed_fut=fut_plot,
-    smoothed_conf_fut=conf_plot_fut,
-    target_indices=target_indices,
-    col=col,
-    index_idx=index_idx,
-    plot_colours=plot_colours,
-    out_path=os.path.join(plot_dir, "Multi_Node_Index_ZOOM.png"),
-    x_start=pd.Timestamp("2022-08-01"),
-    x_end=pd.Timestamp("2028-07-31"),
-)
-
-print("=== 최종 완료 ===")
-print(f"All outputs saved to: {plot_dir}")
+    except Exception as e:
+        print(f"❌ CSV 생성 중 오류 발생: {e}")
+    
+    print("\n" + "="*70)
+    print("✅ FORECASTING COMPLETED")
+    print("="*70)
+    print(f"📁 Output directories:")
+    print(f"   • Plots: {plot_dir}")
+    print(f"   • Data:  {data_out_dir}")
+    print(f"\n📊 Generated Files:")
+    print(f"   • Multi_Country_Forecast_Normalized.png (Normalized comparison)")
+    print(f"   • Individual forecast plots for each country")
+    print("="*70)

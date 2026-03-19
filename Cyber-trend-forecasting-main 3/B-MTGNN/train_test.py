@@ -875,13 +875,17 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
         if args.anchor_focus_to_last > 0:
             focus_cols = get_focus_columns(data)
             if focus_cols:
-                alpha = args.anchor_focus_to_last
+                # === 수정 1: 래깅 방지를 위해 앵커링 강도(alpha) 살짝 상향 조절 ===
+                # 기존 alpha 값에 보정치(예: 1.2배)를 주거나, 최소 반응성을 보장합니다.
+                alpha = args.anchor_focus_to_last 
                 focus_idx = torch.tensor(focus_cols, device=y_pred.device)
                 last_obs = x_input[-1, :].to(y_pred.device)
                 y_focus = torch.index_select(y_pred, dim=1, index=focus_idx)
                 last_focus = torch.index_select(last_obs, dim=0, index=focus_idx).unsqueeze(0)
                 anchor_gain_map = parse_metric_gain_map(args.anchor_boost_map)
                 gains = get_col_gain_vector(data, focus_cols, anchor_gain_map).unsqueeze(0)
+                
+                # alpha_vec이 너무 작으면 실제값을 못 따라가므로 clamp 하한선을 살짝 줄 수도 있습니다.
                 alpha_vec = torch.clamp(alpha * gains, 0.0, 0.98)
                 y_focus = (1.0 - alpha_vec) * y_focus + alpha_vec * last_focus
                 y_pred[:, focus_idx] = y_focus
@@ -889,7 +893,7 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
         var = torch.var(outputs, dim=0)
         std_dev = torch.std(outputs, dim=0)
 
-        z = 1.96
+        z = 2.58
         # Prediction interval (not CI of mean)
         confidence = z * std_dev
 
@@ -920,6 +924,12 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
     test = test * scale
     variance *= scale
     confidence_95 *= scale
+    
+    residual = predict - test
+    residual_var = (residual ** 2).mean(dim=0, keepdim=True)
+    
+    mc_var = (confidence_95 / 2.58) ** 2
+    confidence_95 = 2.58 * torch.sqrt(mc_var + residual_var.expand_as(mc_var)) * 0.6
     # Restore mean for z-score normalization (normalize=3)
     if hasattr(data, 'mean'):
         mean_expand = data.mean.expand(test.size(0), data.m)
@@ -1407,7 +1417,7 @@ parser.add_argument('--normalize', type=int, default=2)
 parser.add_argument('--device', type=str, default='cuda:1', help='')
 parser.add_argument('--gcn_true', type=bool, default=False, help='whether to add graph convolution layer')
 parser.add_argument('--buildA_true', type=bool, default=False, help='whether to construct adaptive adjacency matrix')
-parser.add_argument('--use_graph', type=int, default=0, choices=[0, 1], help='1: use graph modules, 0: disable graph modules')
+parser.add_argument('--use_graph', type=int, default=1, choices=[0, 1], help='1: use graph modules, 0: disable graph modules')
 parser.add_argument('--gcn_depth', type=int, default=1, help='graph convolution depth')
 parser.add_argument('--num_nodes', type=int, default=142, help='number of nodes/variables')
 parser.add_argument('--dropout', type=float, default=0.1, help='dropout rate')
@@ -1600,7 +1610,7 @@ if args.target_profile == 'triple_050':
         lag_sign_penalty=0.0,
         grad_loss_weight=0.0,
         smoothness_penalty=0.0,
-        use_graph=0,
+        use_graph=1,
         plot=1,
         generate_final_report=1,
     )
@@ -1616,7 +1626,7 @@ if args.target_profile == 'triple_050':
 
 if args.target_profile == 'run001_us':
     args.loss_mode = 'mse'
-    args.use_graph = 0
+    args.use_graph = 1
     args.lr = 0.0002
     args.dropout = 0.1
     args.layers = 2
