@@ -213,11 +213,14 @@ class DataLoaderS(object):
         self.test_window = self.dat[test_start:test, :].clone()
 
     def _batchify(self, idx_set, horizon):
-        n = len(idx_set) 
-        X = torch.zeros((n - self.out_len, self.P, self.m)) 
-        Y = torch.zeros((n - self.out_len, self.out_len, self.m)) 
+        # A split can be shorter than the output horizon (e.g. a rolling-origin
+        # fold whose test range is empty); clamp instead of building a tensor
+        # with a negative first dimension.
+        n = max(0, len(idx_set) - self.out_len)
+        X = torch.zeros((n, self.P, self.m))
+        Y = torch.zeros((n, self.out_len, self.m))
 
-        for i in range(n - self.out_len): 
+        for i in range(n): 
             end = idx_set[i] - self.h + 1 
             start = end - self.P 
             
@@ -243,3 +246,27 @@ class DataLoaderS(object):
             Y = Y.to(self.device)
             yield X, Y 
             start_idx += batch_size
+
+
+def revin_window_stats(X, anchor='mean', scale='window_std'):
+    """Per-window normalisation statistics. X: [B, C, N, T] -> two [B, C, N, 1].
+
+    anchor='last' centres each window on its final observation, so the network
+    predicts a CHANGE and a zero output is the random-walk forecast.
+    scale='diff_std' divides by the std of the within-window first differences,
+    the natural unit for a change target.
+    """
+    center = X[..., -1:].clone() if anchor == 'last' else X.mean(dim=-1, keepdim=True)
+    if scale == 'diff_std' and X.size(-1) > 2:
+        sc = (X[..., 1:] - X[..., :-1]).std(dim=-1, keepdim=True)
+    else:
+        sc = X.std(dim=-1, keepdim=True)
+    sc = torch.where(sc.abs() < 1e-8, torch.ones_like(sc), sc)
+    return center, sc
+
+
+def build_net_input(X, center, sc, input_mode='window'):
+    """Tensor actually fed to the network; 'diff' shortens T by one step."""
+    if input_mode == 'diff':
+        return (X[..., 1:] - X[..., :-1]) / sc
+    return (X - center) / sc

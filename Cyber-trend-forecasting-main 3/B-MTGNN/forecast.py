@@ -2,10 +2,19 @@ import numpy as np
 import os
 import torch
 import sys
+
+# The progress messages below contain emoji; on a Windows console defaulting to
+# cp949 they raise UnicodeEncodeError as soon as output is redirected to a file.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 import csv
 import pandas as pd
 from matplotlib import pyplot
 import matplotlib.dates as mdates
+from util import revin_window_stats, build_net_input
 from net import gtnet
 from matplotlib import font_manager, rc
 pyplot.style.use("seaborn-v0_8-dark")
@@ -55,7 +64,7 @@ def zero_negative_curves(data, forecast):
     return data, forecast
 
 
-def save_data(data, forecast, confidence, variance, col, output_dir=None):
+def save_data(data, forecast, confidence, variance, col, output_dir=None, lower=None, upper=None):
     """예측 데이터를 텍스트 파일로 저장"""
     if output_dir is None:
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -76,6 +85,12 @@ def save_data(data, forecast, confidence, variance, col, output_dir=None):
             ff.write('Data: ' + str(d.tolist()) + '\n')
             ff.write('Forecast: ' + str(f.tolist()) + '\n')
             ff.write('95% Confidence: ' + str(c.tolist()) + '\n')
+            if lower is not None and upper is not None:
+                # True MC-dropout quantiles (paper eq. 7-8). The symmetric
+                # '95% Confidence' half-width above is kept for the plotting
+                # path, which draws a symmetric band.
+                ff.write('95% Lower: ' + str(lower[:, i].tolist()) + '\n')
+                ff.write('95% Upper: ' + str(upper[:, i].tolist()) + '\n')
             ff.write('Variance: ' + str(v.tolist()) + '\n')
 
 
@@ -629,17 +644,24 @@ if __name__ == "__main__":
     model = model.to(device)
     print(f"✅ Model loaded on {device}")
     
-    # Input sequence length (모델에서 설정된 값 사용)
-    try:
-        seq_len = model.seq_length
-    except:
-        seq_len = 12  # train_test.py의 기본값
-    
-    P = seq_len
-    print(f"🕹️  Input sequence length: {seq_len} months")
-    
-    # 초기 입력 (마지막 10개월)
-    X_init = torch.from_numpy(dat[-seq_len:, :]).float().to(device)
+    # Input convention, read off the checkpoint that train_test.py stamped.
+    # Old checkpoints carry none of these attributes and fall back to the
+    # original behaviour (mean-centred level window).
+    revin_anchor = getattr(model, 'revin_anchor', 'mean')
+    revin_scale = getattr(model, 'revin_scale', 'window_std')
+    input_mode = getattr(model, 'input_mode', 'window')
+    # With input_mode='diff' the network sees T-1 differences, so the window fed
+    # in is one month longer than model.seq_length.
+    P = int(getattr(model, 'window_len', 0)) or int(getattr(model, 'seq_length', 12)) + (
+        1 if input_mode == 'diff' else 0)
+    delta_scale = getattr(model, 'delta_scale', None)
+    delta_cols = getattr(model, 'delta_scale_cols', None) or []
+    print(f"🕹️  Input window: {P} months  (anchor={revin_anchor}, scale={revin_scale}, input={input_mode})")
+    if delta_scale is not None and len(delta_cols):
+        print(f"   • delta shrinkage applied to {len(delta_cols)} target columns "
+              f"(same as evaluation): {[round(float(delta_scale[c]), 2) for c in delta_cols]}")
+
+    X_init = torch.from_numpy(dat[-P:, :]).float().to(device)
     
     # Forecast settings
     horizon = 12  # 2026년 1~12월 (12개월)
@@ -656,7 +678,8 @@ if __name__ == "__main__":
     with torch.no_grad():
         # 먼저 모델 출력 길이 확인
         tmp_in = X_init.unsqueeze(0).unsqueeze(0).permute(0, 1, 3, 2).contiguous()
-        tmp_out = model(tmp_in)
+        _c, _s = revin_window_stats(tmp_in, revin_anchor, revin_scale)
+        tmp_out = model(build_net_input(tmp_in, _c, _s, input_mode))
         pred_len = int(tmp_out.size(1))
         
         for r in range(num_runs):
@@ -667,12 +690,10 @@ if __name__ == "__main__":
             while len_preds < horizon:
                 curr_input = curr_X.unsqueeze(0).unsqueeze(0).permute(0, 1, 3, 2).contiguous()
                 
-                # RevIN (train_test.py와 동일)
-                w_mean = curr_input.mean(dim=-1, keepdim=True)
-                w_std = curr_input.std(dim=-1, keepdim=True)
-                w_std[w_std == 0] = 1
-                curr_input_norm = (curr_input - w_mean) / w_std
-                
+                # RevIN — same convention the model was trained with
+                w_mean, w_std = revin_window_stats(curr_input, revin_anchor, revin_scale)
+                curr_input_norm = build_net_input(curr_input, w_mean, w_std, input_mode)
+
                 out = model(curr_input_norm)
                 
                 # Denormalize
@@ -680,6 +701,14 @@ if __name__ == "__main__":
                 wm = w_mean[0, 0, :, 0]
                 ws = w_std[0, 0, :, 0]
                 pred_level = pred_block * ws.unsqueeze(0) + wm.unsqueeze(0)
+
+                # Apply the same shrinkage of the predicted change that the
+                # reported evaluation used, relative to the window's anchor.
+                if delta_scale is not None and len(delta_cols):
+                    anchor_level = curr_input[0, 0, :, -1]
+                    lam = delta_scale.to(pred_level.device)
+                    for _c in delta_cols:
+                        pred_level[:, _c] = anchor_level[_c] + lam[_c] * (pred_level[:, _c] - anchor_level[_c])
                 
                 need = horizon - len_preds
                 take = min(pred_level.size(0), need)
@@ -699,15 +728,28 @@ if __name__ == "__main__":
     outputs = torch.stack(outputs)
     Y = torch.mean(outputs, dim=0)
     std_dev = torch.std(outputs, dim=0)
-    confidence = 1.96 * std_dev
     variance = torch.var(outputs, dim=0)
-    
+
+    # 95% interval from the QUANTILES of the MC-dropout distribution (paper
+    # eq. 7-8), not from a normal approximation 1.96*std around the mean.
+    if outputs.size(0) >= 4:
+        q_lo = torch.quantile(outputs, 0.025, dim=0)
+        q_hi = torch.quantile(outputs, 0.975, dim=0)
+    else:
+        q_lo, q_hi = Y - 1.96 * std_dev, Y + 1.96 * std_dev
+    confidence = (q_hi - q_lo) / 2.0
+    _asym = (((q_hi - Y) - (Y - q_lo)).abs() / (q_hi - q_lo).clamp(min=1e-12)).mean()
+    print(f"   • 95% interval from MC quantiles over {outputs.size(0)} draws "
+          f"(mean asymmetry {_asym:.1%} of band width)")
+
     # Denormalization
     scale_torch = torch.from_numpy(scale).float()
     dat_denorm = torch.from_numpy(dat).float() * scale_torch
     Y_denorm = Y * scale_torch
     confidence_denorm = confidence * scale_torch
     variance_denorm = variance * scale_torch
+    q_lo_denorm = q_lo * scale_torch
+    q_hi_denorm = q_hi * scale_torch
     
     print(f"\n📊 Statistics:")
     print(f"   • Mean forecast: {Y_denorm.mean():.4f}")
@@ -716,7 +758,8 @@ if __name__ == "__main__":
     
     # 데이터 저장
     print("\n💾 Saving forecast data...")
-    save_data(dat_denorm, Y_denorm, confidence_denorm, variance_denorm, col, data_out_dir)
+    save_data(dat_denorm, Y_denorm, confidence_denorm, variance_denorm, col, data_out_dir,
+              lower=q_lo_denorm, upper=q_hi_denorm)
     print("✅ Data saved")
     
     # Smoothing: smooth hist+forecast as one continuous series to avoid junction jump,

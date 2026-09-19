@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 
 import glob
+import shutil
 
 MONTH_TO_NUM = {
     'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4,
@@ -122,16 +123,31 @@ def get_focus_columns(data):
 
 
 def parse_month_token(token):
+    """Parse a date token into (year, month).
+
+    Supports both dataset conventions in data/:
+      - 'YY.Mon' (sm_data.csv, e.g. '25.Jan')
+      - 'YYYY-MM' (data.csv, e.g. '2025-01')
+    """
     if token is None:
         return None
-    m = re.match(r'^\s*(\d{2})\.([A-Za-z]{3})\s*$', str(token))
-    if not m:
-        return None
-    yy = int(m.group(1))
-    mon = MONTH_TO_NUM.get(m.group(2).lower())
-    if mon is None:
-        return None
-    return 2000 + yy, mon
+    text = str(token).strip()
+
+    m = re.match(r'^(\d{2})\.([A-Za-z]{3})$', text)
+    if m:
+        mon = MONTH_TO_NUM.get(m.group(2).lower())
+        if mon is None:
+            return None
+        return 2000 + int(m.group(1)), mon
+
+    m = re.match(r'^(\d{4})[-/](\d{1,2})', text)
+    if m:
+        mon = int(m.group(2))
+        if not 1 <= mon <= 12:
+            return None
+        return int(m.group(1)), mon
+
+    return None
 
 
 def compute_effective_split_by_cutoff(data_path, train_ratio, valid_ratio, enforce_cutoff_split, cutoff_year_yy, min_valid_months):
@@ -298,6 +314,25 @@ def compute_focus_rrse(predict_np, ytest_np, data):
     if mode == 'max':
         return float(np.max(values))
     return float(np.mean(values))
+
+
+def estimate_delta_scale(pred_t, true_t, prev_t):
+    """Least-squares shrinkage of the predicted change, fitted on validation only.
+
+    Per column, solves  min_lam  sum_t (prev + lam * (pred - prev) - true)^2.
+    lam = 0 collapses the forecast to persistence, lam = 1 leaves the model
+    untouched.  On a low signal-to-noise series the fitted lam is well below 1,
+    which is exactly the shrinkage an unregularised net fails to apply itself.
+    """
+    device = pred_t.device
+    prev_t = prev_t.to(device)
+    true_t = true_t.to(device)
+    d_hat = pred_t - prev_t
+    d_true = true_t - prev_t
+    num = (d_hat * d_true).sum(dim=0)
+    den = (d_hat * d_hat).sum(dim=0)
+    lam = torch.where(den > 1e-12, num / den, torch.ones_like(den))
+    return lam.clamp(0.0, max(0.0, float(args.delta_scale_clip)))
 
 
 def _get_debias_skip_cols(data):
@@ -538,7 +573,9 @@ def save_metrics_1d(predict, test, title, type):
         f.write('mpe:' + str(mpe) + '\n')
 
 
-def plot_predicted_actual(predicted, actual, title, type, variance, confidence_95):
+def plot_predicted_actual(predicted, actual, title, type, variance, confidence_95, lower=None, upper=None):
+    """`lower`/`upper` carry an asymmetric band (MC-dropout quantiles). When they
+    are omitted the band falls back to predicted +/- confidence_95."""
     months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
     M=[]
     # 2011년부터 2026년까지 넉넉하게 라벨 생성
@@ -563,6 +600,8 @@ def plot_predicted_actual(predicted, actual, title, type, variance, confidence_9
         predicted = predicted[-12:]
         actual = actual[-12:]
         confidence_95 = confidence_95[-12:]
+        if lower is not None:
+            lower, upper = lower[-12:], upper[-12:]
 
     label_len = min(len(predicted), len(target_labels))
     M = target_labels[:label_len]
@@ -570,6 +609,8 @@ def plot_predicted_actual(predicted, actual, title, type, variance, confidence_9
         predicted = predicted[:label_len]
         actual = actual[:label_len]
         confidence_95 = confidence_95[:label_len]
+        if lower is not None:
+            lower, upper = lower[:label_len], upper[:label_len]
 
     # X축 틱: 월별 모두 표시 (Jan 시작 보장)
     for index, value in enumerate(M):
@@ -583,7 +624,12 @@ def plot_predicted_actual(predicted, actual, title, type, variance, confidence_9
     plt.plot(x, predicted, '--', color='purple', label='Predicted')
     if isinstance(confidence_95, torch.Tensor):
         confidence_95 = confidence_95.cpu().numpy()
-    plt.fill_between(x, predicted - confidence_95, predicted + confidence_95, alpha=0.3, color='pink', label='95% Prediction Interval')
+    if lower is not None and upper is not None:
+        lo = lower.cpu().numpy() if isinstance(lower, torch.Tensor) else np.asarray(lower)
+        hi = upper.cpu().numpy() if isinstance(upper, torch.Tensor) else np.asarray(upper)
+    else:
+        lo, hi = predicted - confidence_95, predicted + confidence_95
+    plt.fill_between(x, lo, hi, alpha=0.3, color='pink', label='95% Prediction Interval')
     plt.legend(loc="best", prop={'size': 11})
     plt.axis('tight')
     plt.grid(True)
@@ -611,6 +657,59 @@ def plot_predicted_actual(predicted, actual, title, type, variance, confidence_9
     plt.close()
 
 
+def revin_stats(X):
+    """Per-window normalisation statistics for a batch of input windows.
+
+    X: [B, C, N, T] (C == 1 here).  Returns (center, scale), both [B, C, N, 1].
+
+    ``--revin_anchor last`` centres each window on its LAST observation instead
+    of its mean.  The network then has to predict ``y_t - y_{T}`` (a change)
+    rather than the level itself, so an all-zero output degenerates to the
+    random-walk/persistence forecast — the natural baseline for FX series.
+    With mean-centring the network must re-derive the level from scratch and
+    any level error goes straight into the RSE.
+
+    ``--revin_scale diff_std`` divides by the std of the within-window first
+    differences, which is the right unit for a change target (window std is the
+    unit of a level target and makes the normalised delta vanishingly small).
+    """
+    return revin_window_stats(X, getattr(args, 'revin_anchor', 'mean'),
+                              getattr(args, 'revin_scale', 'window_std'))
+
+
+def net_input(X, center, scale):
+    """Normalised tensor actually fed to the network.
+
+    'window' keeps the (centred) level window; 'diff' hands over the first
+    differences, which shortens the sequence by one step -- `model_seq_length()`
+    must be used when constructing the network.
+    """
+    return build_net_input(X, center, scale, getattr(args, 'input_mode', 'window'))
+
+
+def stamp_preprocessing(model, delta_scale=None, delta_scale_cols=None):
+    """Record the input convention on the module itself.
+
+    forecast.py loads the pickled model and has to reproduce exactly the same
+    normalisation; reading it off the checkpoint keeps the two in step instead
+    of relying on both files being edited together.
+    """
+    model.revin_anchor = getattr(args, 'revin_anchor', 'mean')
+    model.revin_scale = getattr(args, 'revin_scale', 'window_std')
+    model.input_mode = getattr(args, 'input_mode', 'window')
+    model.window_len = args.seq_in_len
+    # Shrinkage applied to the predicted change at evaluation time; forecast.py
+    # must apply the same thing or the operational forecast is not the model
+    # whose RSE was reported.
+    model.delta_scale = None if delta_scale is None else delta_scale.detach().cpu()
+    model.delta_scale_cols = list(delta_scale_cols or [])
+    return model
+
+
+def model_seq_length():
+    return args.seq_in_len - 1 if getattr(args, 'input_mode', 'window') == 'diff' else args.seq_in_len
+
+
 def s_mape(yTrue, yPred):
     eps = 1e-12
     mape = 0
@@ -622,7 +721,8 @@ def s_mape(yTrue, yPred):
 
 
 def _evaluate_direct_mode(data, test_window, model, n_input, is_plot,
-                         split_type='Testing', bias_offset=None, return_arrays=False):
+                         split_type='Testing', bias_offset=None, return_arrays=False,
+                         delta_scale=None):
     """Direct multi-step: single forward pass predicts all future steps at once.
 
     No recursive rollout → no compounding error accumulation.
@@ -631,20 +731,21 @@ def _evaluate_direct_mode(data, test_window, model, n_input, is_plot,
     n_forecast = test_window.shape[0] - n_input
 
     # --- Input context ---
+    # The only rows fed to the model are the n_input months that PRECEDE the
+    # evaluation period; every forecast step comes out of this single forward
+    # pass, so no actual value from the evaluated year reaches the input.
     x_input = test_window[0:n_input, :].clone()          # [T_in, N]
     X = x_input.unsqueeze(0).unsqueeze(0)                 # [1, 1, T_in, N]
     X = X.transpose(2, 3).float()                         # [1, 1, N, T_in]
 
-    # --- RevIN normalisation ---
-    w_mean = X.mean(dim=-1, keepdim=True)                 # [1, 1, N, 1]
-    w_std  = X.std(dim=-1, keepdim=True)                  # [1, 1, N, 1]
-    w_std[w_std == 0] = 1
-    X_norm = (X - w_mean) / w_std
+    # --- RevIN normalisation (see revin_stats) ---
+    w_mean, w_std = revin_stats(X)                        # [1, 1, N, 1] each
+    X_norm = net_input(X, w_mean, w_std)
     wm = w_mean[0, 0, :, 0]                              # [N]
     ws = w_std[0, 0, :, 0]                                # [N]
 
     # --- Forward pass ---
-    num_runs = 1 if args.autotune_mode else 10
+    num_runs = 1 if args.autotune_mode else max(1, int(args.mc_samples))
     outputs = []
 
     # Reset seed for reproducible MC dropout uncertainty
@@ -671,14 +772,24 @@ def _evaluate_direct_mode(data, test_window, model, n_input, is_plot,
         y_pred   = stacked.mean(dim=0)
         var      = stacked.var(dim=0)
         std_dev  = stacked.std(dim=0)
+        if args.point_pred == 'deterministic':
+            model.eval()
+            with torch.no_grad():
+                y_pred = model(X_norm)[0, :, :, 0] * ws.unsqueeze(0) + wm.unsqueeze(0)
+            model.train()
     else:
         y_pred  = outputs[0]
         var     = torch.zeros_like(y_pred)
         std_dev = torch.zeros_like(y_pred)
 
-    z_val = 1.96
-    # Prediction interval (not CI of mean): z * std_dev directly
-    confidence = z_val * std_dev
+    # 95% interval from the QUANTILES of the MC-dropout draws (paper eq. 7-8),
+    # matching the sliding-window path; a normal approximation z*std would
+    # describe a different band from the same samples.
+    if num_runs >= 4:
+        _st = torch.stack(outputs)
+        confidence = (torch.quantile(_st, 0.975, dim=0) - torch.quantile(_st, 0.025, dim=0)) / 2.0
+    else:
+        confidence = 1.96 * std_dev
 
     # --- Trim to actual forecast length ---
     steps = min(args.seq_out_len, n_forecast)
@@ -714,6 +825,19 @@ def _evaluate_direct_mode(data, test_window, model, n_input, is_plot,
         mean_expand = data.mean.expand(steps, data.m)
         predict     = predict + mean_expand
         test_actual = test_actual + mean_expand
+
+    if delta_scale is not None:
+        anchor = (x_input[-1, :] * data.scale)
+        if hasattr(data, 'mean'):
+            anchor = anchor + data.mean
+        anchor = anchor.unsqueeze(0).to(predict.device)
+        lam = delta_scale.to(predict.device).unsqueeze(0)
+        shrink_cols = get_focus_columns(data)
+        if shrink_cols:
+            idx = torch.tensor(shrink_cols, device=predict.device)
+            predict[:, idx] = anchor[:, idx] + lam[:, idx] * (predict[:, idx] - anchor[:, idx])
+        else:
+            predict = anchor + lam * (predict - anchor)
 
     if bias_offset is not None:
         b = bias_offset.to(predict.device)
@@ -808,11 +932,23 @@ def _evaluate_direct_mode(data, test_window, model, n_input, is_plot,
     return rrse, rae, correlation, smape_val, focus_rrse
 
 
-def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_input, is_plot, split_type='Testing', bias_offset=None, return_arrays=False):
+def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_input, is_plot, split_type='Testing', bias_offset=None, return_arrays=False, delta_scale=None):
     # --- Direct mode dispatch ---
     if args.rollout_mode == 'direct' and args.seq_out_len > 1:
         return _evaluate_direct_mode(data, test_window, model, n_input, is_plot,
-                                     split_type, bias_offset, return_arrays)
+                                     split_type, bias_offset, return_arrays, delta_scale)
+
+    # ---- forecast protocol ---------------------------------------------
+    # walk_forward (teacher_forced): to predict month t the window holds the
+    #   actual months up to t-1 and nothing later -- a genuine 1-step-ahead
+    #   forecast, the same information ARIMA/LSTM/TCN baselines are given.
+    # recursive: the window is extended with the model's own output, so no
+    #   actual from the evaluation period is used at all.
+    # Either way the loop below asserts, at every step, that the input window
+    # contains no row at or after the month being predicted.
+    _mode_label = 'walk-forward 1-step (input = actuals strictly before the predicted month)'         if args.rollout_mode == 'teacher_forced' else         'recursive (input extended with the model own predictions; no actual from the evaluation period)'
+    print(f'[{split_type}] forecast protocol: {_mode_label}')
+    # --------------------------------------------------------------------
 
     total_loss = 0
     total_loss_l1 = 0
@@ -820,20 +956,36 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
     predict = None
     test = None
     variance = None
-    confidence_95 = None
+    # confidence_95 is produced once, from the MC-dropout quantiles, after the
+    # rollout finishes -- there is no per-step band to accumulate here.
 
     # ============================================
     r = 5
-    print('testing r=', str(r))
     test_window = test_window.to(data.device)
     
     # 초기 입력 데이터 설정
     x_input = test_window[0:n_input, :].clone()
+    # Row of test_window sitting in each slot of x_input; -1 marks a slot that
+    # holds a model prediction rather than an observation.
+    x_index = list(range(n_input))
+    mc_samples_steps = []   # per step: [S, N] MC-dropout draws
+    # Value the model itself is anchored on at each step: the last slot of its
+    # input window. Under recursive rollout this is the model's own previous
+    # output, so using it (instead of the true previous month) keeps the delta
+    # shrinkage free of any observation from the evaluation period.
+    anchor_steps = []
 
     # [수정 1] fixed_wm, fixed_ws 변수 및 관련 로직 제거
     # 매 반복문(Sliding Window)마다 통계를 새로 계산해야 함
 
     for i in range(n_input, test_window.shape[0]):
+        # No look-ahead: nothing at or after the month being predicted may be in
+        # the input. This is the invariant the whole evaluation rests on.
+        if max(x_index) >= i:
+            raise AssertionError(
+                f'look-ahead in {split_type}: input window holds row {max(x_index)} '
+                f'while predicting row {i}')
+        anchor_steps.append(x_input[-1, :].clone())
         X = torch.unsqueeze(x_input, dim=0)
         X = torch.unsqueeze(X, dim=1)
         X = X.transpose(2, 3)  # [1, 1, N, T]
@@ -842,12 +994,8 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
         # =====================================================
         # [수정 2] Dynamic RevIN: 현재 윈도우(X)의 통계 계산
         # =====================================================
-        w_mean = X.mean(dim=-1, keepdim=True)  # [1, 1, N, 1]
-        w_std = X.std(dim=-1, keepdim=True)    # [1, 1, N, 1]
-        w_std[w_std == 0] = 1 # 0으로 나누기 방지
-        
-        # 정규화 (Normalization)
-        X = (X - w_mean) / w_std
+        w_mean, w_std = revin_stats(X)         # [1, 1, N, 1] each
+        X = net_input(X, w_mean, w_std)
         
         # 나중에 복원을 위해 차원 축소해서 저장
         wm = w_mean[0, 0, :, 0]  # [N]
@@ -856,12 +1004,14 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
 
         y_true = test_window[i: i + 1, :].clone()
 
-        num_runs = 10
+        num_runs = max(1, int(args.mc_samples))
         outputs = []
 
         # Reset seed for reproducible MC dropout
         set_random_seed(fixed_seed + 9999 + i)
 
+        was_training = model.training
+        model.train()  # keep dropout on: the spread across runs is the MC interval
         for _ in range(num_runs):
             with torch.no_grad():
                 output = model(X)
@@ -869,8 +1019,19 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
                 y_pred_single = y_pred_single * ws + wm
                 outputs.append(y_pred_single[:1, :])
 
-        outputs = torch.stack(outputs)
-        y_pred = torch.mean(outputs, dim=0)
+        outputs = torch.stack(outputs)            # [S, 1, N]
+        step_samples = outputs[:, 0, :].clone()   # [S, N] -- kept for the quantile interval
+        if args.point_pred == 'deterministic':
+            # MC-dropout mean is a noisy (and slightly shrunk) estimator of the
+            # point forecast; take the point forecast from the full network and
+            # keep the MC samples only for the interval.
+            model.eval()
+            with torch.no_grad():
+                det = model(X)[-1, :, :, -1].clone() * ws + wm
+            y_pred = det[:1, :]
+        else:
+            y_pred = torch.mean(outputs, dim=0)
+        model.train(was_training)
 
         if args.anchor_focus_to_last > 0:
             focus_cols = get_focus_columns(data)
@@ -891,11 +1052,24 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
                 y_pred[:, focus_idx] = y_focus
 
         var = torch.var(outputs, dim=0)
-        std_dev = torch.std(outputs, dim=0)
 
-        z = 2.58
-        # Prediction interval (not CI of mean)
-        confidence = z * std_dev
+        # Apply the delta shrinkage HERE, not after the rollout: under recursive
+        # rollout the value fed back must be the same calibrated forecast that
+        # gets reported, otherwise the loop compounds uncalibrated changes and
+        # the path drifts. The transform is affine, so doing it in normalised
+        # units is equivalent to doing it in original units.
+        if delta_scale is not None:
+            _anchor = x_input[-1, :].to(y_pred.device).unsqueeze(0)
+            _lam = delta_scale.to(y_pred.device).unsqueeze(0)
+            _cols = get_focus_columns(data)
+            if _cols:
+                _ci = torch.tensor(_cols, device=y_pred.device)
+                y_pred[:, _ci] = _anchor[:, _ci] + _lam[:, _ci] * (y_pred[:, _ci] - _anchor[:, _ci])
+                step_samples[:, _ci] = (_anchor[:, _ci]
+                                        + _lam[:, _ci] * (step_samples[:, _ci] - _anchor[:, _ci]))
+            else:
+                y_pred = _anchor + _lam * (y_pred - _anchor)
+                step_samples = _anchor + _lam * (step_samples - _anchor)
 
         # 다음 스텝을 위한 입력 업데이트
         if args.rollout_mode == 'recursive':
@@ -905,17 +1079,18 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
             next_chunk = y_true
 
         x_input = torch.cat([x_input[1:, :].clone(), next_chunk.detach().clone()], dim=0)
+        x_index = x_index[1:] + [-1 if args.rollout_mode == 'recursive' else i]
+
+        mc_samples_steps.append(step_samples)
 
         if predict is None:
             predict = y_pred
             test = y_true
             variance = var
-            confidence_95 = confidence
         else:
             predict = torch.cat((predict, y_pred))
             test = torch.cat((test, y_true))
             variance = torch.cat((variance, var))
-            confidence_95 = torch.cat((confidence_95, confidence))
 
     # 데이터 스케일(DataLoader의 scale/shift) 복원
     scale = data.scale.expand(test.size(0), data.m)
@@ -923,24 +1098,59 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
     predict = predict * scale
     test = test * scale
     variance *= scale
-    confidence_95 *= scale
-    
-    residual = predict - test
-    residual_var = (residual ** 2).mean(dim=0, keepdim=True)
-    
-    mc_var = (confidence_95 / 2.58) ** 2
-    confidence_95 = 2.58 * torch.sqrt(mc_var + residual_var.expand_as(mc_var)) * 0.6
+
+    # MC-dropout draws, put through exactly the transforms `predict` gets so the
+    # quantiles below describe the same quantity that is scored.
+    mc_samples = torch.stack(mc_samples_steps, dim=1)          # [S, T, N]
+    mc_samples = mc_samples * scale.unsqueeze(0)
+
+    # Anchors the model was actually conditioned on, in the same units as
+    # `predict`. NOT the true previous month: under recursive rollout that
+    # would smuggle an observation from the evaluation period back into the
+    # reported forecast through the shrinkage below.
+    anchors = torch.stack(anchor_steps, dim=0) * scale
+
     # Restore mean for z-score normalization (normalize=3)
     if hasattr(data, 'mean'):
         mean_expand = data.mean.expand(test.size(0), data.m)
         predict = predict + mean_expand
         test    = test + mean_expand
+        mc_samples = mc_samples + mean_expand.unsqueeze(0)
+        anchors = anchors + mean_expand
+
+    # Exposed for callers that fit the shrinkage (rolling CV / val_scale): the
+    # coefficient must be fitted against the same anchor it is applied to.
+    evaluate_sliding_window.last_anchors = anchors.detach().cpu()
+
+    if delta_scale is not None:
+        # Already applied inside the rollout (see above) so that the value fed
+        # back is the calibrated one; nothing left to do here.
+        pass
 
     if bias_offset is not None:
         b = bias_offset.to(predict.device)
         if b.dim() == 1:
             b = b.unsqueeze(0)
         predict = predict - b
+        mc_samples = mc_samples - b.unsqueeze(0)
+
+    # ---- 95% prediction interval from the MC-dropout distribution ----------
+    # Paper eq. (7)-(8): the interval is read off the QUANTILES of the repeated
+    # dropout inferences, not from a normal approximation around their std.
+    if mc_samples.size(0) >= 4:
+        q_lo = torch.quantile(mc_samples, 0.025, dim=0)
+        q_hi = torch.quantile(mc_samples, 0.975, dim=0)
+    else:
+        q_lo = predict - 1.96 * mc_samples.std(dim=0)
+        q_hi = predict + 1.96 * mc_samples.std(dim=0)
+    pi_lower, pi_upper = q_lo, q_hi
+    confidence_95 = (q_hi - q_lo) / 2.0
+    # -----------------------------------------------------------------------
+
+    if args.save_pred_dir:
+        _sd = Path(args.save_pred_dir)
+        _sd.mkdir(parents=True, exist_ok=True)
+        np.save(_sd / f'mc_samples_{split_type}.npy', mc_samples.detach().cpu().numpy())
 
     # --- Metrics 계산: target/all 동시 계산 후 report mode 선택 ---
     selected_cols = get_rse_target_columns(data)
@@ -1011,7 +1221,9 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
             node_name = consistent_name(node_name)
             
             save_metrics_1d(torch.from_numpy(predict[:, col]), torch.from_numpy(Ytest[:, col]), node_name, split_type)
-            plot_predicted_actual(predict[:, col], Ytest[:, col], node_name, split_type, variance[:, col], confidence_95[:, col])
+            plot_predicted_actual(predict[:, col], Ytest[:, col], node_name, split_type, variance[:, col],
+                                  confidence_95[:, col],
+                                  lower=pi_lower[:, col].cpu().numpy(), upper=pi_upper[:, col].cpu().numpy())
             counter += 1
         if skipped_nodes:
             print(f"[{split_type}] skipped near-constant nodes for per-node metrics: {skipped_nodes}")
@@ -1040,11 +1252,9 @@ def evaluate(data, X, Y, model, evaluateL2, evaluateL1, batch_size, is_plot):
         X = torch.unsqueeze(X, dim=1)
         X = X.transpose(2, 3)  # [B, 1, N, T]
 
-        # ===== RevIN: Per-Window Normalization =====
-        w_mean = X.mean(dim=-1, keepdim=True)  # [B, 1, N, 1]
-        w_std = X.std(dim=-1, keepdim=True)    # [B, 1, N, 1]
-        w_std[w_std == 0] = 1
-        X = (X - w_mean) / w_std
+        # ===== RevIN: Per-Window Normalization (see revin_stats) =====
+        w_mean, w_std = revin_stats(X)         # [B, 1, N, 1] each
+        X = net_input(X, w_mean, w_std)
 
         wm = w_mean[:, 0, :, 0]  # [B, N]
         ws = w_std[:, 0, :, 0]   # [B, N]
@@ -1247,11 +1457,12 @@ def train(data, X, Y, model, criterion, optim, batch_size):
         X = torch.unsqueeze(X, dim=1)
         X = X.transpose(2, 3)  # [B, 1, N, T]
 
-        # ===== RevIN: Per-Window Normalization =====
-        w_mean = X.mean(dim=-1, keepdim=True)  # [B, 1, N, 1]
-        w_std = X.std(dim=-1, keepdim=True)    # [B, 1, N, 1]
-        w_std[w_std == 0] = 1
-        X = (X - w_mean) / w_std
+        # ===== RevIN: Per-Window Normalization (see revin_stats) =====
+        w_mean, w_std = revin_stats(X)         # [B, 1, N, 1] each
+        # Last observation in the normalised target space (0 when the window is
+        # anchored on its last value); used by the lag penalties below.
+        last_obs_norm = (X[:, 0, :, -1] - w_mean[:, 0, :, 0]) / w_std[:, 0, :, 0]
+        X = net_input(X, w_mean, w_std)
 
         # Normalize target Y using same window stats
         wm = w_mean[:, 0, :, 0]  # [B, N]
@@ -1357,7 +1568,9 @@ def train(data, X, Y, model, criterion, optim, batch_size):
                     loss = loss + args.bias_penalty * bias_term
 
             if args.lag_penalty_1step > 0 or args.lag_sign_penalty > 0:
-                last_obs = tx[:, 0, :, -1]
+                # Last observation expressed in the normalised target space
+                # (0 when the window is anchored on its last value).
+                last_obs = last_obs_norm
                 pred_1 = output[:, 0, :]
                 true_1 = ty[:, 0, :]
 
@@ -1403,6 +1616,10 @@ def train(data, X, Y, model, criterion, optim, batch_size):
     return total_loss / n_samples
 
 
+# sm_data.csv is the paper's pipeline (README: smoothing.py -> sm_data.csv) and is
+# what Table 2 of the paper was measured on.  data.csv is the same monthly series
+# without the double exponential smoothing; use it when comparing against
+# baselines that were scored on the unsmoothed series.
 DEFAULT_DATA_PATH = BMTGNN_DIR / 'data' / 'sm_data.csv'
 DEFAULT_MODEL_SAVE = MODEL_BASE_DIR / 'model.pt'
 
@@ -1414,6 +1631,13 @@ parser.add_argument('--optim', type=str, default='adam')
 parser.add_argument('--L1Loss', type=bool, default=True)
 parser.add_argument('--loss_mode', type=str, default='l1', choices=['l1', 'mse'], help='training loss type; mse generally aligns better with RSE minimization')
 parser.add_argument('--normalize', type=int, default=2)
+parser.add_argument('--revin_anchor', type=str, default='mean', choices=['mean', 'last'], help="per-window centring: 'last' makes the net predict the change from the last observation (persistence = zero output)")
+parser.add_argument('--input_mode', type=str, default='window', choices=['window', 'diff'], help="'diff' feeds the window's first differences to the network, so momentum is an input feature instead of something the net must learn to compute")
+parser.add_argument('--revin_scale', type=str, default='window_std', choices=['window_std', 'diff_std'], help="per-window scaling: 'diff_std' uses the std of within-window first differences (matched to a change target)")
+parser.add_argument('--lr_scheduler', type=str, default='plateau', choices=['plateau', 'none'], help="'none' keeps the LR fixed; the plateau scheduler reacts to a validation score that is unreliable on a single 12-month window")
+parser.add_argument('--pi_observation_noise', type=int, default=1, choices=[0, 1], help='1: add the observation-noise term (Gal & Ghahramani inverse model precision, estimated from validation residuals) to the MC-dropout predictive distribution. MC dropout alone gives model uncertainty only, which is too narrow for a PREDICTION interval')
+parser.add_argument('--mc_samples', type=int, default=10, help='MC-dropout samples used for the prediction interval')
+parser.add_argument('--point_pred', type=str, default='mc_mean', choices=['mc_mean', 'deterministic'], help="point forecast source: 'deterministic' runs the net in eval() mode, 'mc_mean' averages the MC-dropout samples")
 parser.add_argument('--device', type=str, default='cuda:1', help='')
 parser.add_argument('--gcn_true', type=bool, default=False, help='whether to add graph convolution layer')
 parser.add_argument('--buildA_true', type=bool, default=False, help='whether to construct adaptive adjacency matrix')
@@ -1459,6 +1683,14 @@ parser.add_argument('--rse_report_mode', type=str, default='targets', choices=['
 parser.add_argument('--debias_mode', type=str, default='none', choices=['none', 'val_mean_error', 'val_per_step', 'val_linear', 'val_quadratic', 'val_hybrid'], help='bias correction mode for final evaluation/reporting')
 parser.add_argument('--debias_apply_to', type=str, default='focus', choices=['focus', 'all'], help='apply debias offset to focus targets only or all series')
 parser.add_argument('--debias_skip_nodes', type=str, default='', help='comma-separated node names to SKIP debias for (e.g. kr_fx)')
+parser.add_argument('--rolling_cv', type=int, default=0, choices=[0, 1], help='1: run rolling-origin cross-validation (train on everything before each cut year, score that year) and exit; use it to pick --epochs and --delta_scale_value without touching the test year')
+parser.add_argument('--cv_cuts', type=str, default='108,120,132,144,156', help='row indices at which each CV fold starts; each fold scores the 12 months that follow. Keep the test year OUT of this list -- adding it would tune --epochs and the shrinkage on the year being reported')
+parser.add_argument('--cv_seeds', type=str, default='1,2,3', help='seeds averaged inside every CV fold')
+parser.add_argument('--cv_eval_every', type=int, default=5, help='evaluate the CV folds every N epochs')
+parser.add_argument('--delta_calibrate', type=str, default='none', choices=['none', 'val_scale', 'fixed'], help="'val_scale' fits a per-target shrinkage of the predicted change on the validation split (lam=0 -> persistence, lam=1 -> raw model)")
+parser.add_argument('--delta_scale_map', type=str, default='', help='per-target shrinkage, e.g. "kr_fx:0.83,jp_fx:0.44"; falls back to --delta_scale_value for anything not listed')
+parser.add_argument('--delta_scale_value', type=float, default=0.6, help="shrinkage used when --delta_calibrate fixed; derive it with --rolling_cv 1 rather than from the test year")
+parser.add_argument('--delta_scale_clip', type=float, default=1.5, help='upper clamp for the fitted delta shrinkage factor')
 parser.add_argument('--bias_penalty', type=float, default=0.3, help='lambda for training-time signed-bias penalty (0 disables)')
 parser.add_argument('--bias_penalty_scope', type=str, default='focus', choices=['focus', 'all'], help='scope for training-time bias penalty')
 parser.add_argument('--plot_focus_only', type=int, default=0, help='1 to plot/save only focus nodes')
@@ -1479,7 +1711,7 @@ parser.add_argument('--eval_last_epoch', type=int, default=0, choices=[0, 1], he
 parser.add_argument('--autotune_mode', type=int, default=0, choices=[0, 1], help='1 to optimize for repeated auto-tuning runs')
 parser.add_argument('--apply_best_tuning', type=int, default=0, choices=[0, 1], help='1 to override args with best tuning run values')
 parser.add_argument('--eval_best_tuning', type=int, default=0, choices=[0, 1], help='1 to skip training and evaluate best tuned checkpoint with plotting')
-parser.add_argument('--target_profile', type=str, default='triple_050', choices=['none', 'triple_050', 'run001_us'], help='preset for target-focused optimization setup')
+parser.add_argument('--target_profile', type=str, default='fx_delta', choices=['none', 'fx_delta', 'triple_050', 'run001_us'], help='preset for target-focused optimization setup')
 parser.add_argument('--save_pred_dir', type=str, default='', help='directory to save raw prediction/actual numpy arrays for ensemble')
 parser.add_argument('--ensemble_seeds', type=str, default='', help='comma-separated seeds for multi-seed ensemble (e.g. 777,42,123). Runs all seeds and averages predictions.')
 parser.add_argument('--report_extra_nodes', type=str, default='', help='comma-separated extra node names to include in report plots (used with plot_focus_only=1)')
@@ -1487,14 +1719,21 @@ parser.add_argument('--generate_final_report', type=int, default=1, choices=[0, 
 
 
 args = parser.parse_args()
-# Track which args were explicitly set on CLI (so profiles don't override them)
-_cli_explicit = set()
+# Track which args were explicitly set on CLI (so profiles don't override them).
+# Read sys.argv directly: comparing the parsed value against the parser default
+# misses any flag whose explicit value happens to equal that default (e.g.
+# `--eval_last_epoch 0`), which would then be silently overwritten by a profile.
+_opt_to_dest = {}
 for action in parser._actions:
     if action.dest == 'help':
         continue
-    cli_val = getattr(args, action.dest, None)
-    if cli_val != action.default:
-        _cli_explicit.add(action.dest)
+    for opt in action.option_strings:
+        _opt_to_dest[opt] = action.dest
+_cli_explicit = set()
+for token in sys.argv[1:]:
+    key = token.split('=', 1)[0]
+    if key in _opt_to_dest:
+        _cli_explicit.add(_opt_to_dest[key])
 args.best_tuning_checkpoint = ''
 _autotune_mode_val = args.autotune_mode  # save for post-profile override
 
@@ -1575,6 +1814,113 @@ if args.apply_best_tuning == 1:
         print(f"[apply_best_tuning] error while loading tuning run: {e}")
 
 # Optional target optimization profile
+if args.target_profile == 'fx_delta':
+    # === Configuration selected by rolling-origin CV (--rolling_cv 1) ===
+    # Paper setup: sm_data.csv, 24-month input, 156/12/12 split, walk-forward
+    # 1-step rollout.  Folds are the 12 months of 2020..2024 -- the 2025 test
+    # year is deliberately excluded, so neither the epoch budget nor the
+    # shrinkage is fitted on the year being reported.  Mean RSE over those
+    # folds, against the random-walk forecast:
+    #
+    #             CV mean RSE      persistence
+    #   us index      0.171            0.451
+    #   kr_fx         0.196            0.472
+    #   jp_fx         0.324            0.421
+    #
+    # The shrinkage is the beta=1 ("unbiased") one, not the least-squares one.
+    # Least squares gives a slightly lower CV RSE (0.160/0.183/0.266) but it buys
+    # that by shrinking the predicted change: CV beta comes out 0.88/0.85/0.64,
+    # i.e. the forecast moves less than reality and visibly trails every turn
+    # (worst on jp_fx).  beta=1 costs ~0.01-0.06 RSE and removes the lag.
+    # --rolling_cv 1 prints both so the trade-off stays visible.
+    #
+    # The three ingredients that matter, in order of effect size:
+    #   1. revin_anchor=last -- the network predicts the CHANGE from the last
+    #      observation, so a zero output is the random walk.  Mean-centred
+    #      windows force it to re-derive the level and every level error lands
+    #      straight in the RSE.
+    #   2. input_mode=diff + focus_only_loss -- feed the first differences and
+    #      fit the loss on the FX targets only.  Averaging the loss over all 33
+    #      heterogeneous columns makes the shared temporal filters learn the
+    #      average dynamics of the panel, which is mean-reverting; the fitted
+    #      delta shrinkage then comes out NEGATIVE for the US index.
+    #   3. a fixed CV-chosen budget (40 epochs) + shrinkage.  ~130 training windows
+    #      against ~30k parameters overfits within ~20 epochs, and the single
+    #      12-month validation window is too small to detect it -- its RSE is
+    #      uncorrelated with the test year (measured: |r| < 0.3 at every
+    #      validation length from 12 to 48 months), which is why the budget is
+    #      fixed by CV instead of by early stopping.
+    _profile_defaults = dict(
+        focus_targets=1,
+        focus_nodes='us_Trade Weighted Dollar Index,jp_fx,kr_fx',
+        rse_targets='Us_Trade Weighted Dollar Index_Testing.txt,Jp_fx_Testing.txt,Kr_fx_Testing.txt',
+        rse_report_mode='targets',
+        focus_only_loss=1,
+        focus_target_gain=1.0,
+        focus_gain_map='kr_fx:1.0,jp_fx:1.0,us_Trade Weighted Dollar Index:1.0',
+        focus_weight=1.0,
+        focus_rrse_mode='max',
+        # representation
+        revin_anchor='last',
+        revin_scale='diff_std',
+        input_mode='diff',
+        seq_in_len=24,
+        seq_out_len=1,
+        # capacity / regularisation
+        layers=2,
+        conv_channels=8,
+        residual_channels=16,
+        skip_channels=32,
+        end_channels=64,
+        dropout=0.5,
+        weight_decay=0.01,
+        lr=0.001,
+        batch_size=16,
+        loss_mode='mse',
+        use_graph=1,
+        # fixed budget: validation-based early stopping is unusable here
+        epochs=40,
+        eval_last_epoch=1,
+        lr_scheduler='none',
+        # post-hoc shrinkage of the predicted change, fitted by CV
+        # Paper eq. (7)-(8): the forecast is the MEAN of repeated dropout
+        # inferences and the interval comes from that distribution's quantiles.
+        point_pred='mc_mean',
+        mc_samples=50,
+        delta_calibrate='fixed',
+        delta_scale_value=0.88,
+        delta_scale_map='us_Trade Weighted Dollar Index:0.87,kr_fx:0.88,jp_fx:0.90',
+        # averaging seeds matters more than any single seed on 131 samples
+        ensemble_seeds='1,2,3,4,5,6,7,8',
+        # heuristics from the old profile that the delta parameterisation makes
+        # redundant (anchoring) or actively harmful (scheduled sampling on a
+        # differenced input)
+        ss_prob=0.0,
+        anchor_focus_to_last=0.0,
+        bias_penalty=0.0,
+        lag_penalty_1step=0.0,
+        lag_sign_penalty=0.0,
+        grad_loss_weight=0.0,
+        smoothness_penalty=0.0,
+        debias_mode='none',
+        # Recursive: the window is extended with the model's own output, so no
+        # observation from the evaluation year ever reaches the input.
+        rollout_mode='recursive',
+        clean_cache=1,
+        plot=1,
+        generate_final_report=1,
+    )
+    _overridden = []
+    for _k, _v in _profile_defaults.items():
+        if _k in _cli_explicit:
+            _overridden.append(_k)
+        else:
+            setattr(args, _k, _v)
+    if _overridden:
+        print(f'[target_profile] fx_delta: CLI overrides kept for: {_overridden}')
+    print('[target_profile] applied: fx_delta (delta parameterisation, diff input, '
+          '24-month input, CV-selected 40 epochs, CV-fitted shrinkage, 8-seed ensemble)')
+
 if args.target_profile == 'triple_050':
     # === Proven best configuration (seed=1, 180ep, eval_last) ===
     # us_Trade=0.3927, kr_fx=0.2810, jp_fx=0.2603  (all < 0.5)
@@ -1692,9 +2038,11 @@ def check_lagging(pred_np, actual_np, data, focus_cols):
             print(f'  {data.col[c]}: insufficient data for lag check (T={T})')
             continue
 
-        # Lag-0 vs Lag-1 correlation
+        # Lag-0 vs Lag-1 correlation.  A lagging forecast is one whose value at
+        # t looks like the ACTUAL at t-1, so the comparison is p[1:] against
+        # a[:-1]; correlating p[:-1] with a[1:] tests the opposite (leading).
         lag0_corr = np.corrcoef(p, a)[0, 1] if np.std(p) > 0 and np.std(a) > 0 else 0.0
-        lag1_corr = np.corrcoef(p[:-1], a[1:])[0, 1] if np.std(p[:-1]) > 0 and np.std(a[1:]) > 0 else 0.0
+        lag1_corr = np.corrcoef(p[1:], a[:-1])[0, 1] if np.std(p[1:]) > 0 and np.std(a[:-1]) > 0 else 0.0
 
         # Direction match (does prediction capture direction of change?)
         delta_pred = np.diff(p)
@@ -1714,8 +2062,16 @@ def check_lagging(pred_np, actual_np, data, focus_cols):
         actual_range = a.max() - a.min()
         range_ratio = pred_range / max(actual_range, 1e-12)
 
+        # Amplitude: regression slope of the predicted month-on-month change on
+        # the actual one.  beta < 1 means the forecast systematically moves less
+        # than reality, which is what a trailing curve looks like on a plot --
+        # and it is the failure mode that a least-squares shrinkage introduces.
+        denom = float(np.sum(delta_actual ** 2))
+        beta = float(np.sum(delta_pred * delta_actual) / denom) if denom > 1e-12 else float('nan')
+
         is_lagging = lag1_corr > lag0_corr + 0.05
         is_flat = range_ratio < 0.3
+        under_reacts = np.isfinite(beta) and beta < 0.8
         status = ''
         if is_lagging:
             status += ' LAGGING'
@@ -1723,13 +2079,17 @@ def check_lagging(pred_np, actual_np, data, focus_cols):
         if is_flat:
             status += ' FLAT'
             any_lag = True
+        if under_reacts:
+            status += ' UNDER-REACTING'
+            any_lag = True
         if not status:
             status = ' OK'
 
         print(f'  {data.col[c]:>45s}: lag0_r={lag0_corr:+.4f}  lag1_r={lag1_corr:+.4f}  '
-              f'dir_match={dir_match:.1%}  range_ratio={range_ratio:.2f}  RSE={actual_rse:.4f}  [{status.strip()}]')
+              f'beta={beta:+.2f}  dir_match={dir_match:.1%}  range_ratio={range_ratio:.2f}  '
+              f'RSE={actual_rse:.4f}  [{status.strip()}]')
     if not any_lag:
-        print('  [PASS] No lagging or flatness issues detected.')
+        print('  [PASS] No lag, flatness or under-reaction detected (beta >= 0.8).')
     else:
         print('  [WARN] Potential lagging/flatness detected in some targets.')
     print('='*70 + '\n')
@@ -1993,7 +2353,7 @@ def main(experiment):
                       node_dim=node_dim, dilation_exponential=dilation_ex,
                       conv_channels=conv, residual_channels=res,
                       skip_channels=skip, end_channels=end,
-                      seq_length=args.seq_in_len, in_dim=args.in_dim, out_dim=args.seq_out_len,
+                      seq_length=model_seq_length(), in_dim=args.in_dim, out_dim=args.seq_out_len,
                       layers=layer, propalpha=prop_alpha, tanhalpha=tanh_alpha, layer_norm_affline=False)
         model = model.to(device)
 
@@ -2013,9 +2373,12 @@ def main(experiment):
             model.parameters(), args.optim, lr, args.clip, weight_decay=args.weight_decay
         )
 
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optim.optimizer, mode='min', factor=0.5, patience=15
-        )
+        if args.lr_scheduler == 'plateau':
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optim.optimizer, mode='min', factor=0.5, patience=15
+            )
+        else:
+            scheduler = None
 
         es_counter = 0
         try:
@@ -2062,7 +2425,8 @@ def main(experiment):
                     '| end of epoch {:3d} | time: {:5.2f}s | train_loss {:5.4f} | valid rse {:5.4f} | valid rae {:5.4f} | valid corr  {:5.4f} | valid smape  {:5.4f} | focus_rrse {:5.4f} | obj {:5.4f}'.format(
                         epoch, (time.time() - epoch_start_time), train_loss, val_loss, val_rae, val_corr, val_smape, val_focus_rrse, objective_score), flush=True)
                 
-                scheduler.step(objective_score)
+                if scheduler is not None:
+                    scheduler.step(objective_score)
                 
                 # ===== Best 모델 선택 기준: 전체 RSE + 우선노드 RSE 가중 합 =====
                 safe_corr = val_corr if not math.isnan(val_corr) else 0.0
@@ -2073,7 +2437,7 @@ def main(experiment):
                     save_path.parent.mkdir(parents=True, exist_ok=True)
                     
                     with open(save_path, 'wb') as f:
-                        torch.save(model, f)
+                        torch.save(stamp_preprocessing(model), f)
                     best_val = sum_loss
                     best_rse = val_loss
                     best_rae = val_rae
@@ -2130,8 +2494,13 @@ def main(experiment):
     
     hp_save_path = MODEL_BASE_DIR / 'hp.txt'
     hp_save_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(hp_save_path, "w") as f:
-        f.write(str(best_hp))
+    try:
+        with open(hp_save_path, "w") as f:
+            f.write(str(best_hp))
+    except OSError as _e:
+        # A transient lock on this one bookkeeping file must not abort a
+        # multi-seed ensemble that has already spent minutes training.
+        print(f'[warn] could not write {hp_save_path}: {_e}')
 
     if args.eval_last_epoch == 1:
         print(f"[eval_last_epoch] Using final epoch model (skipping checkpoint load)")
@@ -2198,17 +2567,51 @@ def main(experiment):
                 vals = [f"{bias_offset[t, c].item():.2f}" for t in range(min(12, bias_offset.shape[0]))]
                 print(f"[debias hybrid] {Data.col[c]}: [{', '.join(vals)}]")
 
+    # ===== Delta shrinkage fitted on validation only =====
+    delta_scale = None
+    if args.delta_calibrate == 'fixed':
+        delta_scale = torch.full((Data.m,), float(args.delta_scale_value), device=device)
+        _lam_map = parse_metric_gain_map(args.delta_scale_map)
+        for _c in range(Data.m):
+            _key = _normalize_metric_name(Data.col[_c])
+            if _key in _lam_map:
+                delta_scale[_c] = float(_lam_map[_key])
+        _fc = get_focus_columns(Data)
+        print('[delta_calibrate] fixed shrinkage (from --rolling_cv, not from the test year): '
+              + ', '.join(f'{Data.col[c]}={delta_scale[c].item():.2f}' for c in (_fc or [])))
+    elif args.delta_calibrate == 'val_scale':
+        set_random_seed(fixed_seed)
+        _, _, _, _, _, _vp, _vt = evaluate_sliding_window(
+            Data, Data.valid_window, model, evaluateL2, evaluateL1, args.seq_in_len, False, 'Validation', return_arrays=True
+        )
+        _prev_v = evaluate_sliding_window.last_anchors
+        delta_scale = estimate_delta_scale(_vp.to(_prev_v.device), _vt.to(_prev_v.device), _prev_v)
+        _fc = get_focus_columns(Data)
+        if _fc:
+            print('[delta_calibrate] val-fitted shrinkage: '
+                  + ', '.join(f'{Data.col[c]}={delta_scale[c].item():.3f}' for c in _fc))
+
+    # Persist the model the reported metrics were produced with, together with
+    # its input convention and shrinkage, so forecast.py operates on exactly the
+    # predictor that was evaluated (with eval_last_epoch the best-validation
+    # checkpoint written during training is NOT the one evaluated).
+    _save_path = Path(args.save)
+    _save_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(_save_path, 'wb') as _f:
+        torch.save(stamp_preprocessing(model, delta_scale, get_focus_columns(Data)), _f)
+    print(f'[save] operational model -> {_save_path}')
+
     # Reset seed before final evaluation for reproducibility
     set_random_seed(fixed_seed)
 
     vtest_acc, vtest_rae, vtest_corr, vtest_smape, _ = evaluate_sliding_window(
-        Data, Data.valid_window, model, evaluateL2, evaluateL1, args.seq_in_len, args.plot == 1, 'Validation', bias_offset=bias_offset
+        Data, Data.valid_window, model, evaluateL2, evaluateL1, args.seq_in_len, args.plot == 1, 'Validation', bias_offset=bias_offset, delta_scale=delta_scale
     )
 
     set_random_seed(fixed_seed)
 
     test_acc, test_rae, test_corr, test_smape, test_focus_rrse = evaluate_sliding_window(
-        Data, Data.test_window, model, evaluateL2, evaluateL1, args.seq_in_len, args.plot == 1, 'Testing', bias_offset=bias_offset
+        Data, Data.test_window, model, evaluateL2, evaluateL1, args.seq_in_len, args.plot == 1, 'Testing', bias_offset=bias_offset, delta_scale=delta_scale
     )
 
     # ============================================================
@@ -2220,7 +2623,7 @@ def main(experiment):
     _confidence_np = None
     if _final_focus_cols:
         _, _, _, _, _, _fp, _ft = evaluate_sliding_window(
-            Data, Data.test_window, model, evaluateL2, evaluateL1, args.seq_in_len, False, 'Testing', bias_offset=bias_offset, return_arrays=True
+            Data, Data.test_window, model, evaluateL2, evaluateL1, args.seq_in_len, False, 'Testing', bias_offset=bias_offset, return_arrays=True, delta_scale=delta_scale
         )
         _fp_np = _fp.cpu().numpy() if hasattr(_fp, 'cpu') else _fp
         _ft_np = _ft.cpu().numpy() if hasattr(_ft, 'cpu') else _ft
@@ -2262,6 +2665,14 @@ def main(experiment):
         _save_dir.mkdir(parents=True, exist_ok=True)
         np.save(_save_dir / "pred_Testing.npy", _fp_np)
         np.save(_save_dir / "actual_Testing.npy", _ft_np)
+        # Validation residuals size the prediction interval; the test residuals
+        # must not be used for that or the interval is fitted to its own score.
+        set_random_seed(fixed_seed)
+        _, _, _, _, _, _vp2, _vt2 = evaluate_sliding_window(
+            Data, Data.valid_window, model, evaluateL2, evaluateL1, args.seq_in_len,
+            False, 'Validation', bias_offset=bias_offset, return_arrays=True, delta_scale=delta_scale)
+        np.save(_save_dir / "pred_Validation.npy", _vp2.cpu().numpy())
+        np.save(_save_dir / "actual_Validation.npy", _vt2.cpu().numpy())
         print(f'[save] Predictions saved to {_save_dir}')
 
     # ============================================================
@@ -2291,9 +2702,16 @@ def main(experiment):
             ck_dir = Path(args.save_pred_dir) / ("best_%s" % safe_name)
             ck_file = ck_dir / "model_state.pt"
             if ck_file.exists():
-                # Load per-target best checkpoint
+                # Load per-target best checkpoint. A checkpoint left over from a
+                # run with different seq_in_len / channel widths will not fit the
+                # current architecture -- skip it rather than aborting the run.
                 state = torch.load(ck_file, weights_only=True, map_location=device)
-                base_model.load_state_dict(state)
+                try:
+                    base_model.load_state_dict(state)
+                except RuntimeError as _e:
+                    print(f"  {tname}: checkpoint at {ck_file} does not match the current "
+                          f"architecture, skipping ({_e.__class__.__name__})")
+                    continue
                 base_model.to(device)
                 base_model.eval()
                 # Evaluate with this checkpoint
@@ -2394,7 +2812,269 @@ def main(experiment):
     return vtest_acc, vtest_rae, vtest_corr, vtest_smape, test_acc, test_rae, test_corr, test_smape
 
 
+def run_rolling_cv():
+    """Rolling-origin cross-validation over the years before the test year.
+
+    For every cut index the model is trained only on rows < cut and scored on
+    the following 12 months, so no fold ever sees its own target year. Two
+    things are read off the result: how many epochs to train (the budget that
+    minimises the averaged fold RSE) and how far to shrink the predicted change
+    (`--delta_scale_value`). Deriving either from the single validation year is
+    unreliable here -- one 12-month window is dominated by whichever regime
+    happened to prevail in it.
+    """
+    cuts = [int(x) for x in args.cv_cuts.split(',') if x.strip()]
+    seeds = [int(x) for x in args.cv_seeds.split(',') if x.strip()]
+    every = max(1, int(args.cv_eval_every))
+    total_rows = pd.read_csv(args.data).shape[0]
+
+    evaluateL2 = nn.MSELoss(reduction='sum').to(device)
+    evaluateL1 = nn.L1Loss(reduction='sum').to(device)
+    criterion = (nn.L1Loss(reduction='sum') if args.loss_mode == 'l1' else nn.MSELoss(reduction='sum')).to(device)
+
+    store = {}
+    col_names = None
+    focus_cols = None
+    for cut in cuts:
+        for sd in seeds:
+            set_random_seed(sd)
+            Data = DataLoaderS(args.data, cut / total_rows, 12 / total_rows, device,
+                               args.horizon, args.seq_in_len, args.normalize, args.seq_out_len)
+            args.num_nodes = Data.train[0].shape[2]
+            if col_names is None:
+                col_names = Data.col
+                focus_cols = get_focus_columns(Data)
+            use_graph = bool(args.use_graph)
+            model = gtnet(use_graph, use_graph, args.gcn_depth, args.num_nodes, device, Data.adj,
+                          dropout=args.dropout, subgraph_size=args.subgraph_size, node_dim=args.node_dim,
+                          dilation_exponential=args.dilation_exponential, conv_channels=args.conv_channels,
+                          residual_channels=args.residual_channels, skip_channels=args.skip_channels,
+                          end_channels=args.end_channels, seq_length=model_seq_length(), in_dim=args.in_dim,
+                          out_dim=args.seq_out_len, layers=args.layers, propalpha=args.propalpha,
+                          tanhalpha=args.tanhalpha, layer_norm_affline=False).to(device)
+            optim = Optim(model.parameters(), args.optim, args.lr, args.clip, weight_decay=args.weight_decay)
+            for ep in range(1, args.epochs + 1):
+                train(Data, Data.train[0], Data.train[1], model, criterion, optim, args.batch_size)
+                if ep % every == 0:
+                    _, _, _, _, _, pr, tr = evaluate_sliding_window(
+                        Data, Data.valid_window, model, evaluateL2, evaluateL1,
+                        args.seq_in_len, False, 'Validation', return_arrays=True)
+                    pv = evaluate_sliding_window.last_anchors
+                    store[(cut, sd, ep)] = (pr.cpu().numpy(), tr.cpu().numpy(), pv.cpu().numpy())
+            print(f'[rolling_cv] fold cut={cut} seed={sd} done', flush=True)
+
+    eps = sorted({k[2] for k in store})
+    print()
+    print('=' * 78)
+    print(f'ROLLING-ORIGIN CV  ({len(cuts)} folds x {len(seeds)} seeds)')
+    print('=' * 78)
+    summary = {}
+    for c in (focus_cols or []):
+        name = col_names[c]
+        pers = {}
+        for cut in cuts:
+            _, tr, pv = store[(cut, seeds[0], eps[0])]
+            pers[cut] = _rse_1d(pv[:, c], tr[:, c])
+        print()
+        print(f'  {name}   persistence mean={np.mean(list(pers.values())):.4f}')
+        print(f'    {"epoch":>6} {"lam_LS":>7} {"CV RSE":>8}   {"lam_b1":>7} {"CV RSE":>8}   per-fold (lam_LS)')
+        best = None
+        for ep in eps:
+            dh, dt, num, den, sc = {}, {}, {}, {}, {}
+            for cut in cuts:
+                pr = np.mean([store[(cut, sd, ep)][0][:, c] for sd in seeds], axis=0)
+                _, tr, pv = store[(cut, seeds[0], ep)]
+                dh[cut], dt[cut] = pr - pv[:, c], tr[:, c] - pv[:, c]
+                sc[cut] = max(np.sqrt((dt[cut] ** 2).mean()), 1e-12)
+                num[cut] = (dh[cut] * dt[cut]).sum() / sc[cut] ** 2
+                den[cut] = (dh[cut] ** 2).sum() / sc[cut] ** 2
+            lam_all = float(np.clip(sum(num.values()) / max(sum(den.values()), 1e-12), 0.0, args.delta_scale_clip))
+            # Least squares shrinks the predicted change (it trades amplitude for
+            # MSE), which shows up as systematic under-reaction -- the forecast
+            # trails every turn. lam_unbiased instead makes the regression slope
+            # of predicted change on actual change equal 1, i.e. no lag.
+            _num_b1 = sum((dt[c] * dt[c]).sum() / sc[c] ** 2 for c in cuts)
+            _den_b1 = sum((dh[c] * dt[c]).sum() / sc[c] ** 2 for c in cuts)
+            lam_unb = float(np.clip(_num_b1 / max(_den_b1, 1e-12), 0.0, args.delta_scale_clip))
+            per_fold = []
+            for cut in cuts:
+                lam = float(np.clip((sum(num.values()) - num[cut]) / max(sum(den.values()) - den[cut], 1e-12),
+                                    0.0, args.delta_scale_clip))
+                _, tr, pv = store[(cut, seeds[0], ep)]
+                per_fold.append(_rse_1d(pv[:, c] + lam * dh[cut], tr[:, c]))
+            m = float(np.mean(per_fold))
+            # beta of the unbiased-calibrated forecast, for the lag report
+            per_b1 = []
+            for cut in cuts:
+                _, tr, pv = store[(cut, seeds[0], ep)]
+                per_b1.append(_rse_1d(pv[:, c] + lam_unb * dh[cut], tr[:, c]))
+            print(f'    {ep:6d} {lam_all:7.3f} {m:8.4f}   {lam_unb:7.3f} {np.mean(per_b1):8.4f}   '
+                  + ' '.join(f'{2011 + cut // 12}={v:.3f}' for cut, v in zip(cuts, per_fold)))
+            if best is None or m < best[1]:
+                best = (ep, m, lam_all, lam_unb)
+        summary[name] = best
+        print(f'    -> best: epochs={best[0]}  CV RSE={best[1]:.4f}  lam_LS={best[2]:.3f}  '
+              f'lam_unbiased={best[3]:.3f}  (persistence {np.mean(list(pers.values())):.4f})')
+
+    print()
+    print('  Suggested settings per target:')
+    for k, v in summary.items():
+        print(f'    {k}: --epochs {v[0]}  lam_LS={v[2]:.2f} (min RSE)  lam_unbiased={v[3]:.2f} (no lag)')
+    print('=' * 78)
+
+
+def _rse_1d(pred, actual):
+    den = np.sum((actual - actual.mean()) ** 2)
+    return float(np.sqrt(np.sum((pred - actual) ** 2) / den)) if den > 1e-12 else float('inf')
+
+
+def run_seed_ensemble(seeds):
+    """Train one model per seed and average their test forecasts.
+
+    Averaging independently-seeded runs cancels the initialisation/dropout
+    variance that dominates on a 131-sample training set, which is worth more
+    here than any single lucky seed.
+    """
+    global fixed_seed
+
+    base_pred_dir = Path(args.save_pred_dir) if args.save_pred_dir else (BMTGNN_DIR / 'ensemble_runs')
+    base_save = args.save
+    want_plot, want_report = args.plot, args.generate_final_report
+    args.plot, args.generate_final_report = 0, 0
+
+    preds, actual = [], None
+    val_preds, val_actual = [], None
+    mc_samples = []
+    for sd in seeds:
+        fixed_seed = sd
+        args.seed = sd
+        args.save_pred_dir = str(base_pred_dir / f'seed_{sd}')
+        args.save = str(Path(base_save).with_name(Path(base_save).stem + f'_seed{sd}.pt'))
+        print()
+        print('=' * 70)
+        print(f'[ensemble] training seed {sd}')
+        print('=' * 70)
+        main(0)
+        run_dir = Path(args.save_pred_dir)
+        preds.append(np.load(run_dir / 'pred_Testing.npy'))
+        actual = np.load(run_dir / 'actual_Testing.npy')
+        if (run_dir / 'pred_Validation.npy').exists():
+            val_preds.append(np.load(run_dir / 'pred_Validation.npy'))
+            val_actual = np.load(run_dir / 'actual_Validation.npy')
+        if (run_dir / 'mc_samples_Testing.npy').exists():
+            mc_samples.append(np.load(run_dir / 'mc_samples_Testing.npy'))
+
+    args.plot, args.generate_final_report = want_plot, want_report
+    args.save = base_save
+    # forecast.py loads the single operational model at args.save; point it at
+    # the first seed so the paper's train_test.py -> forecast.py flow works.
+    _first = Path(base_save).with_name(Path(base_save).stem + f'_seed{seeds[0]}.pt')
+    if _first.exists():
+        shutil.copyfile(_first, base_save)
+        print(f'[ensemble] operational model for forecast.py <- seed {seeds[0]} ({base_save})')
+    mean_pred = np.mean(np.stack(preds, axis=0), axis=0)
+
+    # ---- prediction interval -------------------------------------------
+    # Spread across the independently-seeded runs captures only model
+    # uncertainty; on its own it is far too narrow, because the seeds agree
+    # with each other much more closely than the ensemble agrees with reality.
+    # A 95% PREDICTION interval also needs the irreducible one-step error,
+    # estimated from the VALIDATION residuals (using the test residuals would
+    # fit the interval to the very errors it is meant to cover).
+    seed_std = np.std(np.stack(preds, axis=0), axis=0)
+    if mc_samples:
+        # Pool every dropout draw from every seed into one predictive sample set
+        # and read the interval off its quantiles (paper eq. 7-8), so the band
+        # carries both the dropout (Bayesian) and the seed (initialisation)
+        # spread instead of a normal approximation to either.
+        pooled = np.concatenate(mc_samples, axis=0)        # [n_seeds*S, T, N]
+        _noise_note = ''
+        if args.pi_observation_noise and val_preds and val_actual is not None:
+            # Gal & Ghahramani (2016) eq. for the predictive variance:
+            #     Var[y*] ~= (MC variance) + tau^-1
+            # The second term is the observation noise, WITHOUT which the
+            # interval describes only how unsure the model is about its own
+            # mean -- not how far the truth tends to land from it. tau^-1 is
+            # estimated from the validation residuals (never the test ones).
+            sigma = (np.mean(np.stack(val_preds, axis=0), axis=0) - val_actual).std(axis=0)
+            rng = np.random.default_rng(fixed_seed)
+            pooled = pooled + rng.normal(0.0, 1.0, size=pooled.shape) * sigma[None, None, :]
+            _noise_note = ' + observation noise from validation residuals'
+        pi_lower = np.quantile(pooled, 0.025, axis=0)
+        pi_upper = np.quantile(pooled, 0.975, axis=0)
+        confidence = (pi_upper - pi_lower) / 2.0
+        print(f'[interval] 95% PI from MC-dropout quantiles over {pooled.shape[0]} pooled draws '
+              f'({len(mc_samples)} seeds x {mc_samples[0].shape[0]} dropout samples){_noise_note}')
+    else:
+        pi_lower = mean_pred - 1.96 * seed_std
+        pi_upper = mean_pred + 1.96 * seed_std
+        confidence = 1.96 * seed_std
+        print('[interval] 95% PI from ensemble spread only (no MC samples found)')
+    # --------------------------------------------------------------------
+
+    cols = create_columns(args.data)
+    focus = [cols.index(n) for n in get_focus_nodes() if n in cols]
+
+    print()
+    print('#' * 70)
+    print(f'#  SEED-ENSEMBLE RESULTS  (seeds={seeds})')
+    print('#' + '-' * 68 + '#')
+    print('#  {:>45s}  {:>10s}  {:>8s}  #'.format('Target', 'RSE', 'Pass?'))
+    for c in focus:
+        a = actual[:, c]
+        den = np.sum((a - a.mean()) ** 2)
+        singles = [np.sqrt(np.sum((pr[:, c] - a) ** 2) / den) for pr in preds]
+        rse = np.sqrt(np.sum((mean_pred[:, c] - a) ** 2) / den) if den > 1e-12 else float('inf')
+        print(f'#  {cols[c]:>45s}  {rse:10.4f}  {"YES" if rse < 0.5 else "NO":>8s}  #')
+        print(f'#      per-seed: {", ".join(f"{v:.4f}" for v in singles)}')
+    print('#' + '-' * 68 + '#')
+    for c in focus:
+        inside = float(np.mean((actual[:, c] >= pi_lower[:, c]) & (actual[:, c] <= pi_upper[:, c])))
+        print(f'#  {cols[c]:>45s}  95% PI coverage {inside:6.0%}  #')
+    print('#' * 70)
+
+    class _Holder:
+        pass
+    _h = _Holder()
+    _h.col = cols
+    check_lagging(mean_pred, actual, _h, focus)
+
+    if want_plot:
+        # Drop the previous run's Validation artefacts too: the ensemble path
+        # only regenerates Testing, and leaving stale files behind invites
+        # reading them as if they came from this model.
+        clear_split_outputs('Validation')
+        clear_split_outputs('Testing')
+        for c in range(mean_pred.shape[1]):
+            if np.std(actual[:, c]) < 1e-10:
+                continue
+            name = consistent_name(cols[c])
+            save_metrics_1d(torch.from_numpy(mean_pred[:, c]), torch.from_numpy(actual[:, c]), name, 'Testing')
+            plot_predicted_actual(mean_pred[:, c], actual[:, c], name, 'Testing',
+                                  seed_std[:, c], confidence[:, c],
+                                  lower=pi_lower[:, c], upper=pi_upper[:, c])
+    np.save(base_pred_dir / 'pred_Testing_ensemble.npy', mean_pred)
+    np.save(base_pred_dir / 'actual_Testing.npy', actual)
+    print(f'[ensemble] averaged predictions -> {base_pred_dir}')
+    return mean_pred, actual, cols, focus
+
+
 if __name__ == "__main__":
+    if args.rolling_cv == 1:
+        run_rolling_cv()
+        sys.exit(0)
+
+    _seeds = [int(x) for x in args.ensemble_seeds.split(',') if x.strip()]
+    if _seeds:
+        _mp, _ac, _cols, _focus = run_seed_ensemble(_seeds)
+        if args.generate_final_report:
+            class _ColHolder:
+                pass
+            _holder = _ColHolder()
+            _holder.col = _cols
+            generate_final_report(_mp, _ac, _holder, _focus)
+        sys.exit(0)
+
     vacc = []
     vrae = []
     vcorr = []
