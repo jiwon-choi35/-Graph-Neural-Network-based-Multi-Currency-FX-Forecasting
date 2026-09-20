@@ -1,4 +1,5 @@
 import argparse
+import functools
 import math
 import time
 import torch
@@ -269,6 +270,77 @@ def get_rse_target_columns(data):
         print(f"[WARNING] rse_targets matching failed! tokens={tokens} → falling back to ALL {data.m} columns. Check rse_targets names.")
         return list(range(data.m))
     return selected
+
+def save_npy(path, arr, required=True, attempts=5):
+    """np.save that survives a transient lock on the target file.
+
+    Writing straight after another write to the same directory intermittently
+    fails on Windows with EINVAL (errno 22) -- a virus scanner or indexer
+    holding the freshly created file. It is transient: the same write succeeds
+    moments later. An 8-seed ensemble is ~20 minutes of compute, so aborting it
+    because one diagnostic array could not be written is the wrong trade;
+    `required=False` arrays warn and are skipped instead.
+    """
+    for attempt in range(attempts):
+        try:
+            np.save(path, arr)
+            return True
+        except OSError as exc:
+            if attempt + 1 < attempts:
+                time.sleep(0.4 * (attempt + 1))
+                continue
+            if required:
+                raise
+            print(f'[warn] could not write {path} after {attempts} attempts ({exc}); continuing without it')
+            return False
+
+
+def write_with_retry(fn, *a, what='file', attempts=5, **kw):
+    """Run a filesystem write that intermittently fails on Windows with EINVAL.
+
+    Same transient condition `save_npy` documents -- a scanner or indexer
+    holding a file that was written moments earlier -- but here the casualty is
+    the whole run: copying the operational model into place is the LAST step of
+    an 8-seed ensemble, so one EINVAL threw away ~20 minutes of finished
+    training with every metric already computed.
+    """
+    for attempt in range(attempts):
+        try:
+            return fn(*a, **kw)
+        except OSError as exc:
+            if attempt + 1 >= attempts:
+                raise
+            print(f'[warn] {what}: write failed ({exc}); retry {attempt + 1}/{attempts - 1}')
+            time.sleep(0.4 * (attempt + 1))
+
+
+def preserve_global_rng(fn):
+    """Stop a function's internal reseeding from leaking into the caller's RNG.
+
+    The MC-dropout passes reseed all three global generators so the reported
+    interval is reproducible. That reseeding used to persist after the call.
+    Validation runs once per epoch, so from epoch 2 onwards training resumed
+    from an identical RNG state every time: the same batch order and the same
+    dropout masks, epoch after epoch (measured: 8 leading train indices went
+    [46, 34, 110, ...] in epoch 1 and [102, 17, 115, ...] in every epoch after).
+    Shuffling and dropout were doing nothing across epochs.
+    """
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        py_state = random.getstate()
+        np_state = np.random.get_state()
+        th_state = torch.random.get_rng_state()
+        cu_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        try:
+            return fn(*a, **kw)
+        finally:
+            random.setstate(py_state)
+            np.random.set_state(np_state)
+            torch.random.set_rng_state(th_state)
+            if cu_state is not None:
+                torch.cuda.set_rng_state_all(cu_state)
+    return wrapper
+
 
 def compute_rrse_rae_subset(predict_t, test_t, selected_cols):
     pred = predict_t[:, selected_cols]
@@ -818,13 +890,23 @@ def _evaluate_direct_mode(data, test_window, model, n_input, is_plot,
     scale = data.scale.expand(steps, data.m)
     predict       = predict * scale
     test_actual   = test_actual * scale
-    variance      = variance * scale
-    confidence_95 = confidence_95 * scale
+    variance      = variance * scale ** 2   # Var[s*y] = s^2 Var[y]
+    confidence_95 = confidence_95 * scale   # a half-width is linear in s
     # Restore mean for z-score normalization (normalize=3)
     if hasattr(data, 'mean'):
         mean_expand = data.mean.expand(steps, data.m)
         predict     = predict + mean_expand
         test_actual = test_actual + mean_expand
+
+    # Anchor the forecast was conditioned on, in the units `predict` is in.
+    # Callers that fit the delta shrinkage (--delta_calibrate val_scale) and
+    # run_rolling_cv read this off the evaluator; direct mode never set it, so
+    # both died with AttributeError on 'last_anchors'.
+    _anchor_row = x_input[-1, :] * data.scale
+    if hasattr(data, 'mean'):
+        _anchor_row = _anchor_row + data.mean
+    evaluate_sliding_window.last_anchors = (
+        _anchor_row.detach().unsqueeze(0).expand(steps, data.m).cpu().clone())
 
     if delta_scale is not None:
         anchor = (x_input[-1, :] * data.scale)
@@ -833,17 +915,30 @@ def _evaluate_direct_mode(data, test_window, model, n_input, is_plot,
         anchor = anchor.unsqueeze(0).to(predict.device)
         lam = delta_scale.to(predict.device).unsqueeze(0)
         shrink_cols = get_focus_columns(data)
+        # The band has to be shrunk with the point forecast. Writing the
+        # transform out on a bound, anchor + lam*(pred +/- c - anchor), shows the
+        # half-width scales by lam; leaving c alone would report a calibrated
+        # centre inside an uncalibrated interval. (The sliding-window path gets
+        # this for free -- it shrinks the MC draws themselves and re-reads the
+        # quantiles afterwards.)
         if shrink_cols:
             idx = torch.tensor(shrink_cols, device=predict.device)
             predict[:, idx] = anchor[:, idx] + lam[:, idx] * (predict[:, idx] - anchor[:, idx])
+            confidence_95[:, idx] = confidence_95[:, idx] * lam[:, idx].abs()
         else:
             predict = anchor + lam * (predict - anchor)
+            confidence_95 = confidence_95 * lam.abs()
 
     if bias_offset is not None:
         b = bias_offset.to(predict.device)
         if b.dim() == 1:
             b = b.unsqueeze(0)
         predict = predict - b
+
+    # Same band the sliding-window path publishes, so generate_final_report can
+    # draw the interval whichever protocol produced the forecast.
+    evaluate_sliding_window.last_interval = (
+        (predict - confidence_95).detach().cpu(), (predict + confidence_95).detach().cpu())
 
     # --- Metrics (tensor) ---
     selected_cols = get_rse_target_columns(data)
@@ -923,8 +1018,8 @@ def _evaluate_direct_mode(data, test_window, model, n_input, is_plot,
     if args.save_pred_dir:
         save_dir_np = Path(args.save_pred_dir)
         save_dir_np.mkdir(parents=True, exist_ok=True)
-        np.save(save_dir_np / f"pred_{split_type}.npy", predict_np)
-        np.save(save_dir_np / f"actual_{split_type}.npy", test_np)
+        save_npy(save_dir_np / f"pred_{split_type}.npy", predict_np)
+        save_npy(save_dir_np / f"actual_{split_type}.npy", test_np)
         print(f"[save] {split_type} predictions -> {save_dir_np}")
 
     if return_arrays:
@@ -932,6 +1027,7 @@ def _evaluate_direct_mode(data, test_window, model, n_input, is_plot,
     return rrse, rae, correlation, smape_val, focus_rrse
 
 
+@preserve_global_rng
 def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_input, is_plot, split_type='Testing', bias_offset=None, return_arrays=False, delta_scale=None):
     # --- Direct mode dispatch ---
     if args.rollout_mode == 'direct' and args.seq_out_len > 1:
@@ -939,6 +1035,17 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
                                      split_type, bias_offset, return_arrays, delta_scale)
 
     # ---- forecast protocol ---------------------------------------------
+    # 'direct' only has a meaning when the net emits more than one step. With
+    # seq_out_len == 1 it used to fall through to the loop below and silently
+    # run walk-forward, so a run could report walk-forward numbers while its
+    # log said 'direct'. Refuse instead of guessing.
+    if args.rollout_mode == 'direct':
+        raise SystemExit(
+            "--rollout_mode direct needs --seq_out_len > 1 (got %d). For a 1-step "
+            "horizon choose the protocol explicitly: --rollout_mode teacher_forced "
+            "(walk-forward, input = actuals strictly before the predicted month) or "
+            "--rollout_mode recursive (no actual from the evaluation period)."
+            % args.seq_out_len)
     # walk_forward (teacher_forced): to predict month t the window holds the
     #   actual months up to t-1 and nothing later -- a genuine 1-step-ahead
     #   forecast, the same information ARIMA/LSTM/TCN baselines are given.
@@ -1097,7 +1204,10 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
 
     predict = predict * scale
     test = test * scale
-    variance *= scale
+    # Var[s * y] = s^2 * Var[y]: undoing the normalisation on a VARIANCE squares
+    # the factor. (The plotted band comes from the MC quantiles below, so this
+    # only ever showed up in the number handed to plot_predicted_actual.)
+    variance *= scale ** 2
 
     # MC-dropout draws, put through exactly the transforms `predict` gets so the
     # quantiles below describe the same quantity that is scored.
@@ -1145,12 +1255,20 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
         q_hi = predict + 1.96 * mc_samples.std(dim=0)
     pi_lower, pi_upper = q_lo, q_hi
     confidence_95 = (q_hi - q_lo) / 2.0
+    # Exposed for generate_final_report: the report figure took a confidence_np
+    # argument that main() never filled in, so the headline
+    # final_forecast_results.png shipped without its 95% band.
+    evaluate_sliding_window.last_interval = (pi_lower.detach().cpu(), pi_upper.detach().cpu())
     # -----------------------------------------------------------------------
 
-    if args.save_pred_dir:
+    # Only the last dump survives anyway, so writing this on every per-epoch
+    # validation call is [S, T, N] floats of pure waste -- and with S=50 it is
+    # enough disk churn to hit transient write failures mid-training. main()
+    # turns the flag on for the final evaluations.
+    if args.save_pred_dir and getattr(evaluate_sliding_window, 'dump_mc_samples', False):
         _sd = Path(args.save_pred_dir)
         _sd.mkdir(parents=True, exist_ok=True)
-        np.save(_sd / f'mc_samples_{split_type}.npy', mc_samples.detach().cpu().numpy())
+        save_npy(_sd / f'mc_samples_{split_type}.npy', mc_samples.detach().cpu().numpy(), required=False)
 
     # --- Metrics 계산: target/all 동시 계산 후 report mode 선택 ---
     selected_cols = get_rse_target_columns(data)
@@ -1679,6 +1797,7 @@ parser.add_argument('--focus_gain_map', type=str, default='kr_fx:2.0,jp_fx:1.0,u
 parser.add_argument('--anchor_focus_to_last', type=float, default=0.2, help='0~1 level anchoring strength for focus columns during evaluation/forecast')
 parser.add_argument('--anchor_boost_map', type=str, default='kr_fx:1.8,jp_fx:1.0,us_Trade Weighted Dollar Index:1.0', help='per-focus-node anchor multiplier map')
 parser.add_argument('--rse_targets', type=str, default='Us_Trade Weighted Dollar Index_Testing.txt,Jp_fx_Testing.txt,Kr_fx_Testing.txt', help='comma-separated target series/file names used for terminal RSE/RAE aggregation')
+parser.add_argument('--rse_pass_threshold', type=float, default=0.4, help='RSE at or below which a target is reported as passing')
 parser.add_argument('--rse_report_mode', type=str, default='targets', choices=['targets', 'all'], help='which RSE/RAE to report in terminal and final summary')
 parser.add_argument('--debias_mode', type=str, default='none', choices=['none', 'val_mean_error', 'val_per_step', 'val_linear', 'val_quadratic', 'val_hybrid'], help='bias correction mode for final evaluation/reporting')
 parser.add_argument('--debias_apply_to', type=str, default='focus', choices=['focus', 'all'], help='apply debias offset to focus targets only or all series')
@@ -1711,7 +1830,10 @@ parser.add_argument('--eval_last_epoch', type=int, default=0, choices=[0, 1], he
 parser.add_argument('--autotune_mode', type=int, default=0, choices=[0, 1], help='1 to optimize for repeated auto-tuning runs')
 parser.add_argument('--apply_best_tuning', type=int, default=0, choices=[0, 1], help='1 to override args with best tuning run values')
 parser.add_argument('--eval_best_tuning', type=int, default=0, choices=[0, 1], help='1 to skip training and evaluate best tuned checkpoint with plotting')
-parser.add_argument('--target_profile', type=str, default='fx_delta', choices=['none', 'fx_delta', 'triple_050', 'run001_us'], help='preset for target-focused optimization setup')
+parser.add_argument('--target_profile', type=str, default='fx_delta_wf', choices=['none', 'fx_delta', 'fx_delta_wf', 'triple_050', 'run001_us'],
+                    help='preset for target-focused optimization setup. Default fx_delta_wf is the reported '
+                         'walk-forward 1-step configuration; fx_delta is the recursive 12-month one, whose RSE '
+                         'is an order of magnitude larger because it is a different task (see PROTOCOL.md)')
 parser.add_argument('--save_pred_dir', type=str, default='', help='directory to save raw prediction/actual numpy arrays for ensemble')
 parser.add_argument('--ensemble_seeds', type=str, default='', help='comma-separated seeds for multi-seed ensemble (e.g. 777,42,123). Runs all seeds and averages predictions.')
 parser.add_argument('--report_extra_nodes', type=str, default='', help='comma-separated extra node names to include in report plots (used with plot_focus_only=1)')
@@ -1921,6 +2043,114 @@ if args.target_profile == 'fx_delta':
     print('[target_profile] applied: fx_delta (delta parameterisation, diff input, '
           '24-month input, CV-selected 40 epochs, CV-fitted shrinkage, 8-seed ensemble)')
 
+if args.target_profile == 'fx_delta_wf':
+    # === Walk-forward 1-step configuration, selected by rolling-origin CV ===
+    #
+    # Same delta parameterisation as fx_delta; the difference is the forecast
+    # protocol.  fx_delta rolls out recursively (12 months from a single origin,
+    # no observation from the evaluation year), which is a much harder task than
+    # the one the paper's ARIMA/LSTM/TCN table reports.  This profile runs the
+    # protocol those baselines actually use: to predict month t the input window
+    # holds the actual months up to t-1 and nothing later.  That is a 1-step
+    # forecast, not a 12-month one, and it uses test-period observations as
+    # LAGGED INPUTS -- which is standard and leakage-free (evaluate_sliding_window
+    # asserts at every step that no row at or after the predicted month is in the
+    # window), but it must be stated as such in the paper.
+    #
+    # Settings come from --rolling_cv 1 --rollout_mode teacher_forced over the
+    # 12-month folds of 2020..2024.  The 2025 test year is never in a fold, so
+    # neither the epoch budget nor the shrinkage is fitted on the reported year.
+    #
+    # CV mean RSE over those five folds, and what the 2025 test year came out
+    # at for the 8-seed ensemble, against the two things worth comparing to
+    # (see baselines.py: `bound` is the irreducible 1-step error implied by the
+    # double exponential smoothing, so there is no room below it to speak of):
+    #
+    #                 CV mean   persistence | 2025 test   AR(3)   bound
+    #   us index       0.132       0.451    |   0.1188   0.1226  0.1377
+    #   kr_fx          0.157       0.472    |   0.1068   0.0935  0.1018
+    #   jp_fx          0.270       0.421    |   0.1440   0.1369  0.1450
+    #
+    # fx_delta reports 0.171 / 0.196 / 0.324 for the same CV -- that profile's
+    # header quotes walk-forward CV numbers but then sets rollout_mode=recursive,
+    # which is a different and much harder task (see PROTOCOL.md).
+    #
+    # Two changes over fx_delta carry the improvement:
+    #   1. seq_in_len 24 -> 12.  The smoothed target is a Holt level+trend, whose
+    #      1-step increment depends on ~3 lags; a 24-month window mostly adds
+    #      parameters (the skip convolution is sized by the window) and windows
+    #      are the scarce resource here, not months.
+    #   2. point_pred deterministic.  At dropout 0.5 the MC mean is a noisy
+    #      estimator of the point forecast.  The MC draws are still collected, so
+    #      the paper's eq. (7)-(8) interval is unchanged -- only the point
+    #      forecast now comes from the full network.
+    _profile_defaults = dict(
+        focus_targets=1,
+        focus_nodes='us_Trade Weighted Dollar Index,jp_fx,kr_fx',
+        rse_targets='Us_Trade Weighted Dollar Index_Testing.txt,Jp_fx_Testing.txt,Kr_fx_Testing.txt',
+        rse_report_mode='targets',
+        focus_only_loss=1,
+        focus_target_gain=1.0,
+        focus_gain_map='kr_fx:1.0,jp_fx:1.0,us_Trade Weighted Dollar Index:1.0',
+        focus_weight=1.0,
+        focus_rrse_mode='max',
+        # representation: the net predicts the CHANGE from the last observation
+        revin_anchor='last',
+        revin_scale='diff_std',
+        input_mode='diff',
+        seq_in_len=12,
+        seq_out_len=1,
+        # capacity / regularisation
+        layers=2,
+        conv_channels=8,
+        residual_channels=16,
+        skip_channels=32,
+        end_channels=64,
+        dropout=0.5,
+        weight_decay=0.01,
+        lr=0.001,
+        batch_size=16,
+        loss_mode='mse',
+        use_graph=1,
+        # CV picked the top of the swept range for all three targets (US 120,
+        # kr 120, jp 120 at --cv_eval_every 10); the curve is still flat-ish
+        # descending there, so this is a budget, not a minimum.
+        epochs=120,
+        eval_last_epoch=1,
+        lr_scheduler='none',
+        # point forecast from the full network; MC draws kept for the interval
+        point_pred='deterministic',
+        mc_samples=50,
+        # Least-squares shrinkage from the same CV run, per target.
+        delta_calibrate='fixed',
+        delta_scale_value=0.884,
+        delta_scale_map='us_Trade Weighted Dollar Index:0.884,kr_fx:0.898,jp_fx:0.671',
+        ensemble_seeds='1,2,3,4,5,6,7,8',
+        # heuristics the delta parameterisation makes redundant or harmful
+        ss_prob=0.0,
+        anchor_focus_to_last=0.0,
+        bias_penalty=0.0,
+        lag_penalty_1step=0.0,
+        lag_sign_penalty=0.0,
+        grad_loss_weight=0.0,
+        smoothness_penalty=0.0,
+        debias_mode='none',
+        rollout_mode='teacher_forced',
+        clean_cache=1,
+        plot=1,
+        generate_final_report=1,
+    )
+    _overridden = []
+    for _k, _v in _profile_defaults.items():
+        if _k in _cli_explicit:
+            _overridden.append(_k)
+        else:
+            setattr(args, _k, _v)
+    if _overridden:
+        print(f'[target_profile] fx_delta_wf: CLI overrides kept for: {_overridden}')
+    print('[target_profile] applied: fx_delta_wf (walk-forward 1-step, 12-month input, '
+          'deterministic point forecast, CV-selected epochs and shrinkage, 8-seed ensemble)')
+
 if args.target_profile == 'triple_050':
     # === Proven best configuration (seed=1, 180ep, eval_last) ===
     # us_Trade=0.3927, kr_fx=0.2810, jp_fx=0.2603  (all < 0.5)
@@ -1947,7 +2177,15 @@ if args.target_profile == 'triple_050':
         focus_gain_map='kr_fx:1.0,jp_fx:1.0,us_Trade Weighted Dollar Index:1.0',
         anchor_focus_to_last=0.06,
         anchor_boost_map='kr_fx:1.8,jp_fx:1.0,us_Trade Weighted Dollar Index:1.0',
-        rollout_mode='direct',
+        # This profile used to say 'direct' while running with seq_out_len=1.
+        # 'direct' has no meaning at a 1-step horizon, so the old code fell
+        # through to the walk-forward loop and the log named a protocol the run
+        # did not use; once that fall-through was closed the profile could only
+        # abort, always after a full training run. PROTOCOL.md measured both
+        # paths on the same seed and budget and they agree to the last digit
+        # (0.4632 / 0.2562 / 0.2991), so the quoted numbers are walk-forward
+        # numbers -- name the protocol they actually came from.
+        rollout_mode='teacher_forced',
         debias_mode='none',
         debias_apply_to='focus',
         bias_penalty=0.5,
@@ -1968,7 +2206,7 @@ if args.target_profile == 'triple_050':
             setattr(args, _k, _v)
     if _overridden:
         print(f'[target_profile] triple_050: CLI overrides kept for: {_overridden}')
-    print('[target_profile] applied: triple_050 (seed=1, l1, 180ep, eval_last, direct, focus_only=1)')
+    print('[target_profile] applied: triple_050 (seed=1, l1, 180ep, eval_last, walk-forward 1-step, focus_only=1)')
 
 if args.target_profile == 'run001_us':
     args.loss_mode = 'mse'
@@ -2022,6 +2260,30 @@ def set_random_seed(seed):
 
 
 fixed_seed = args.seed
+
+# Protocol sanity check, before anything is trained. The evaluator makes the
+# same check, but it only runs once training is finished -- a bad combination
+# cost a full run (180 epochs) before saying so.
+if args.rollout_mode == 'direct' and args.seq_out_len == 1:
+    raise SystemExit(
+        "--rollout_mode direct needs --seq_out_len > 1 (got 1). For a 1-step "
+        "horizon name the protocol explicitly: --rollout_mode teacher_forced "
+        "(walk-forward, input = actuals strictly before the predicted month) or "
+        "--rollout_mode recursive (no actual from the evaluation period). "
+        "See PROTOCOL.md.")
+
+# --num_split > 1 is not wired up. train() still builds the node permutation
+# `id`, but it feeds the model the FULL node set and never passes `id` to
+# gtnet.forward(input, idx). Each extra split therefore recomputes the same
+# loss on the same data, backward()s into gradients that are not zeroed between
+# splits, and takes another optimiser step -- silently training at num_split
+# times the intended rate rather than on node subgraphs.
+if args.num_split != 1:
+    raise SystemExit(
+        f"--num_split {args.num_split} is not supported: the node-subgraph "
+        "training path is not connected (train() never passes its node subset "
+        "to the model), so any value above 1 just repeats the same update. "
+        "Use --num_split 1.")
 
 
 def check_lagging(pred_np, actual_np, data, focus_cols):
@@ -2095,7 +2357,8 @@ def check_lagging(pred_np, actual_np, data, focus_cols):
     print('='*70 + '\n')
 
 
-def generate_final_report(pred_np, actual_np, data, focus_cols, confidence_np=None):
+def generate_final_report(pred_np, actual_np, data, focus_cols, confidence_np=None,
+                          lower_np=None, upper_np=None, seed_label=None):
     """Auto-generate final_forecast_results.png and final_summary_table.png
     using in-memory prediction arrays. This provides standardised submission outputs."""
     import matplotlib
@@ -2139,7 +2402,12 @@ def generate_final_report(pred_np, actual_np, data, focus_cols, confidence_np=No
         ax.plot(x, p, '--s', color='purple', linewidth=2, markersize=6,
                 label=f'Predicted (RSE={rse:.4f})', alpha=0.85)
 
-        if confidence_np is not None:
+        # The MC-dropout band is asymmetric, so draw the quantiles themselves
+        # when they are available and fall back to +/- half-width otherwise.
+        if lower_np is not None and upper_np is not None:
+            ax.fill_between(x, lower_np[:, c], upper_np[:, c], alpha=0.25, color='pink',
+                            label='95% Prediction Interval')
+        elif confidence_np is not None:
             ci = confidence_np[:, c]
             ax.fill_between(x, p - ci, p + ci, alpha=0.25, color='pink',
                             label='95% Prediction Interval')
@@ -2152,10 +2420,16 @@ def generate_final_report(pred_np, actual_np, data, focus_cols, confidence_np=No
         ax.set_xticklabels(labels, fontsize=10, rotation=45)
         ax.axhline(y=a.mean(), color='gray', linestyle=':', alpha=0.4)
 
-    seed_str = f'seed={fixed_seed}'
+    # fixed_seed is the global the ensemble loop leaves pointing at its LAST
+    # seed, so an 8-seed ensemble figure used to be captioned 'seed=8'.
+    seed_str = seed_label or f'seed={fixed_seed}'
     fig.suptitle(
         f'B-MTGNN Exchange Rate Forecasting — 2025 Test Period\n'
-        f'TRIPLE050 ({seed_str}, focus_only_loss=1, no_graph, lr={args.lr})',
+        # The protocol belongs on the figure: a walk-forward 1-step panel and a
+        # 12-month-ahead panel look identical but are not the same claim.
+        f'{"walk-forward 1-step (input = actuals before the predicted month)" if args.rollout_mode == "teacher_forced" else "12-month-ahead from 2024-12 (no actual from the test period)"}\n'
+        f'profile={args.target_profile} ({seed_str}, lr={args.lr}, '
+        f'graph={"on" if args.use_graph else "off"})',
         fontsize=16, fontweight='bold', y=0.99
     )
     plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -2174,7 +2448,7 @@ def generate_final_report(pred_np, actual_np, data, focus_cols, confidence_np=No
         name = data.col[c]
         r = rse_results.get(name, {})
         rse_val = r.get('rse', 0)
-        status = 'PASS' if rse_val < 0.5 else 'FAIL'
+        status = 'PASS' if rse_val < args.rse_pass_threshold else 'FAIL'
         rows.append([
             name,
             f'{rse_val:.4f}',
@@ -2201,7 +2475,9 @@ def generate_final_report(pred_np, actual_np, data, focus_cols, confidence_np=No
         table[i + 1, n_cols - 1].set_facecolor(color)
 
     ax2.set_title(
-        f'Per-Target RSE Summary (seed={fixed_seed}, {args.epochs}ep, '
+        f'Per-Target RSE Summary — {args.rollout_mode} rollout, '
+        f'PASS at RSE < {args.rse_pass_threshold}\n'
+        f'({seed_str}, {args.epochs}ep, '
         f'{"eval_last" if args.eval_last_epoch else "best_val"})',
         fontsize=13, fontweight='bold', pad=20
     )
@@ -2215,6 +2491,11 @@ def generate_final_report(pred_np, actual_np, data, focus_cols, confidence_np=No
 
 def main(experiment):
     set_random_seed(fixed_seed)
+
+    # Per-epoch validation calls must not dump MC samples; re-armed below, just
+    # before the final evaluations. Reset here so an ensemble's later seeds do
+    # not inherit the flag from the previous seed's final pass.
+    evaluate_sliding_window.dump_mc_samples = False
 
     # ===== Fixed HP (0209 최적 결과 기반) - no random search =====
     best_val = 10000000
@@ -2435,9 +2716,8 @@ def main(experiment):
                 if objective_score < best_objective:
                     save_path = Path(args.save)
                     save_path.parent.mkdir(parents=True, exist_ok=True)
-                    
-                    with open(save_path, 'wb') as f:
-                        torch.save(stamp_preprocessing(model), f)
+                    write_with_retry(torch.save, stamp_preprocessing(model), str(save_path),
+                                     what='best-validation checkpoint')
                     best_val = sum_loss
                     best_rse = val_loss
                     best_rae = val_rae
@@ -2597,12 +2877,16 @@ def main(experiment):
     # checkpoint written during training is NOT the one evaluated).
     _save_path = Path(args.save)
     _save_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(_save_path, 'wb') as _f:
-        torch.save(stamp_preprocessing(model, delta_scale, get_focus_columns(Data)), _f)
+    _stamped = stamp_preprocessing(model, delta_scale, get_focus_columns(Data))
+    write_with_retry(torch.save, _stamped, str(_save_path), what='operational model')
     print(f'[save] operational model -> {_save_path}')
 
     # Reset seed before final evaluation for reproducibility
     set_random_seed(fixed_seed)
+
+    # From here on the MC-dropout draws are the ones the reported interval is
+    # built from, so start writing them out.
+    evaluate_sliding_window.dump_mc_samples = True
 
     vtest_acc, vtest_rae, vtest_corr, vtest_smape, _ = evaluate_sliding_window(
         Data, Data.valid_window, model, evaluateL2, evaluateL1, args.seq_in_len, args.plot == 1, 'Validation', bias_offset=bias_offset, delta_scale=delta_scale
@@ -2620,19 +2904,28 @@ def main(experiment):
     set_random_seed(fixed_seed)
     _final_focus_cols = get_focus_columns(Data)
     _fp = _ft = _fp_np = _ft_np = None
-    _confidence_np = None
+    _confidence_np = _lower_np = _upper_np = None
     if _final_focus_cols:
         _, _, _, _, _, _fp, _ft = evaluate_sliding_window(
             Data, Data.test_window, model, evaluateL2, evaluateL1, args.seq_in_len, False, 'Testing', bias_offset=bias_offset, return_arrays=True, delta_scale=delta_scale
         )
         _fp_np = _fp.cpu().numpy() if hasattr(_fp, 'cpu') else _fp
         _ft_np = _ft.cpu().numpy() if hasattr(_ft, 'cpu') else _ft
+        # Band belonging to exactly this evaluation (see last_interval).
+        _lo_t, _hi_t = getattr(evaluate_sliding_window, 'last_interval', (None, None))
+        if _lo_t is not None:
+            _lower_np, _upper_np = _lo_t.numpy(), _hi_t.numpy()
+            _confidence_np = (_upper_np - _lower_np) / 2.0
 
     print('\n')
     print('#' * 70)
     print('#' + ' ' * 18 + 'FINAL RESULTS SUMMARY' + ' ' * 19 + '#')
     print('#' * 70)
     print(f'#  Profile:   {args.target_profile}')
+    # The protocol decides what these numbers mean, so it belongs in the summary:
+    # walk-forward and 12-month-ahead RSE differ by an order of magnitude.
+    print(f'#  Protocol:  {args.rollout_mode}'
+          f'{" (1-step; input = actuals before the predicted month)" if args.rollout_mode == "teacher_forced" else " (12-month path; no actual from the test period)"}')
     print(f'#  Seed:      {fixed_seed}')
     print(f'#  Epochs:    {args.epochs}')
     print(f'#  Eval mode: {"eval_last_epoch" if args.eval_last_epoch else "best_val_checkpoint"}')
@@ -2647,14 +2940,15 @@ def main(experiment):
             _a = _ft_np[:, _c]
             _den = np.sum((_a - _a.mean())**2)
             _rse = np.sqrt(np.sum((_p - _a)**2) / _den) if _den > 1e-12 else float('inf')
-            _pass = 'YES' if _rse < 0.5 else 'NO'
-            if _rse >= 0.5:
+            _pass = 'YES' if _rse < args.rse_pass_threshold else 'NO'
+            if _rse >= args.rse_pass_threshold:
                 _all_pass = False
             print(f'#  {Data.col[_c]:>45s}  {_rse:10.4f}  {_pass:>6s}  #')
     print('#' + '-' * 68 + '#')
     print(f'#  Overall RSE (agg): {test_acc:.4f}   RAE: {test_rae:.4f}   Corr: {test_corr:.4f}')
     print(f'#  Focus RRSE (max):  {test_focus_rrse:.4f}' if test_focus_rrse is not None else '')
-    _verdict = 'ALL TARGETS PASS (< 0.5)' if _all_pass else 'SOME TARGETS FAILED'
+    _verdict = (f'ALL TARGETS PASS (< {args.rse_pass_threshold})' if _all_pass
+                else f'SOME TARGETS FAILED (>= {args.rse_pass_threshold})')
     print(f'#  Verdict:           {_verdict}')
     print('#' * 70)
 
@@ -2663,16 +2957,16 @@ def main(experiment):
         from pathlib import Path as _P
         _save_dir = _P(args.save_pred_dir)
         _save_dir.mkdir(parents=True, exist_ok=True)
-        np.save(_save_dir / "pred_Testing.npy", _fp_np)
-        np.save(_save_dir / "actual_Testing.npy", _ft_np)
+        save_npy(_save_dir / "pred_Testing.npy", _fp_np)
+        save_npy(_save_dir / "actual_Testing.npy", _ft_np)
         # Validation residuals size the prediction interval; the test residuals
         # must not be used for that or the interval is fitted to its own score.
         set_random_seed(fixed_seed)
         _, _, _, _, _, _vp2, _vt2 = evaluate_sliding_window(
             Data, Data.valid_window, model, evaluateL2, evaluateL1, args.seq_in_len,
             False, 'Validation', bias_offset=bias_offset, return_arrays=True, delta_scale=delta_scale)
-        np.save(_save_dir / "pred_Validation.npy", _vp2.cpu().numpy())
-        np.save(_save_dir / "actual_Validation.npy", _vt2.cpu().numpy())
+        save_npy(_save_dir / "pred_Validation.npy", _vp2.cpu().numpy())
+        save_npy(_save_dir / "actual_Validation.npy", _vt2.cpu().numpy())
         print(f'[save] Predictions saved to {_save_dir}')
 
     # ============================================================
@@ -2685,7 +2979,9 @@ def main(experiment):
     # AUTO-GENERATE FINAL REPORT IMAGES
     # ============================================================
     if args.generate_final_report and _final_focus_cols and _fp_np is not None:
-        generate_final_report(_fp_np, _ft_np, Data, _final_focus_cols, confidence_np=_confidence_np)
+        generate_final_report(_fp_np, _ft_np, Data, _final_focus_cols,
+                              confidence_np=_confidence_np,
+                              lower_np=_lower_np, upper_np=_upper_np)
 
     # ===== Per-target best checkpoint evaluation =====
     if args.save_pred_dir and hasattr(main, '_per_target_best_val'):
@@ -2728,8 +3024,8 @@ def main(experiment):
                 print("  %s: test_RSE=%.4f  (val_RSE=%.4f)" % (tname, t_rse, v_rse))
 
                 # Also save numpy predictions from this per-target checkpoint
-                np.save(ck_dir / "pred_Testing.npy", tp_np)
-                np.save(ck_dir / "actual_Testing.npy", ta_np)
+                save_npy(ck_dir / "pred_Testing.npy", tp_np, required=False)
+                save_npy(ck_dir / "actual_Testing.npy", ta_np, required=False)
                 # Also try debias modes
                 _, _, _, _, _, vp_ck, va_ck = evaluate_sliding_window(
                     Data, Data.valid_window, base_model, evaluateL2, evaluateL1,
@@ -2970,7 +3266,7 @@ def run_seed_ensemble(seeds):
     # the first seed so the paper's train_test.py -> forecast.py flow works.
     _first = Path(base_save).with_name(Path(base_save).stem + f'_seed{seeds[0]}.pt')
     if _first.exists():
-        shutil.copyfile(_first, base_save)
+        write_with_retry(shutil.copyfile, _first, base_save, what='operational model copy')
         print(f'[ensemble] operational model for forecast.py <- seed {seeds[0]} ({base_save})')
     mean_pred = np.mean(np.stack(preds, axis=0), axis=0)
 
@@ -3012,6 +3308,10 @@ def run_seed_ensemble(seeds):
         print('[interval] 95% PI from ensemble spread only (no MC samples found)')
     # --------------------------------------------------------------------
 
+    # The ensemble builds its own band (pooled MC draws + observation noise);
+    # hand it to the report instead of letting the figure fall back to none.
+    run_seed_ensemble.last_interval = (pi_lower, pi_upper)
+
     cols = create_columns(args.data)
     focus = [cols.index(n) for n in get_focus_nodes() if n in cols]
 
@@ -3025,7 +3325,7 @@ def run_seed_ensemble(seeds):
         den = np.sum((a - a.mean()) ** 2)
         singles = [np.sqrt(np.sum((pr[:, c] - a) ** 2) / den) for pr in preds]
         rse = np.sqrt(np.sum((mean_pred[:, c] - a) ** 2) / den) if den > 1e-12 else float('inf')
-        print(f'#  {cols[c]:>45s}  {rse:10.4f}  {"YES" if rse < 0.5 else "NO":>8s}  #')
+        print(f'#  {cols[c]:>45s}  {rse:10.4f}  {"YES" if rse < args.rse_pass_threshold else "NO":>8s}  #')
         print(f'#      per-seed: {", ".join(f"{v:.4f}" for v in singles)}')
     print('#' + '-' * 68 + '#')
     for c in focus:
@@ -3053,8 +3353,8 @@ def run_seed_ensemble(seeds):
             plot_predicted_actual(mean_pred[:, c], actual[:, c], name, 'Testing',
                                   seed_std[:, c], confidence[:, c],
                                   lower=pi_lower[:, c], upper=pi_upper[:, c])
-    np.save(base_pred_dir / 'pred_Testing_ensemble.npy', mean_pred)
-    np.save(base_pred_dir / 'actual_Testing.npy', actual)
+    save_npy(base_pred_dir / 'pred_Testing_ensemble.npy', mean_pred)
+    save_npy(base_pred_dir / 'actual_Testing.npy', actual)
     print(f'[ensemble] averaged predictions -> {base_pred_dir}')
     return mean_pred, actual, cols, focus
 
@@ -3072,7 +3372,11 @@ if __name__ == "__main__":
                 pass
             _holder = _ColHolder()
             _holder.col = _cols
-            generate_final_report(_mp, _ac, _holder, _focus)
+            _e_lo, _e_hi = getattr(run_seed_ensemble, 'last_interval', (None, None))
+            generate_final_report(_mp, _ac, _holder, _focus,
+                                  lower_np=_e_lo, upper_np=_e_hi,
+                                  seed_label=f'{len(_seeds)}-seed ensemble '
+                                             f'(seeds={",".join(str(x) for x in _seeds)})')
         sys.exit(0)
 
     vacc = []

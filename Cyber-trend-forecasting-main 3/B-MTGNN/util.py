@@ -165,12 +165,20 @@ class DataLoaderS(object):
 
 
     def _normalized(self, normalize):
+        # Every branch has to leave self.scale set: __init__ moves it to the
+        # device straight after this call, and every evaluation path undoes the
+        # normalisation with it. Modes 0 and 1 used to skip it and died with
+        # AttributeError before a single batch was built.
         if (normalize == 0):
             self.dat = self.rawdat
+            self.scale = torch.ones(self.m)
 
         if (normalize == 1):
             train_max = torch.max(self.rawdat[:self.train_end, :])
+            if train_max == 0:
+                train_max = torch.tensor(1.0)
             self.dat = self.rawdat / train_max
+            self.scale = torch.full((self.m,), float(train_max))
 
         # normalized by the maximum value of each row(sensor).
         if (normalize == 2):
