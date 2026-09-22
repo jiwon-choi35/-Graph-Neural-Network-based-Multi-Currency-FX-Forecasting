@@ -1600,7 +1600,7 @@ if args.target_profile == 'triple_050':
         focus_rrse_mode='max',
         focus_gain_map='kr_fx:1.0,jp_fx:1.0,us_Trade Weighted Dollar Index:1.0',
         anchor_focus_to_last=0.06,
-        anchor_boost_map='kr_fx:1.8,jp_fx:1.0,us_Trade Weighted Dollar Index:1.0',
+        anchor_boost_map='kr_fx:1.8,jp_fx:1.0,us_Trade Weighted Dollar Index:5.0',
         rollout_mode='direct',
         debias_mode='none',
         debias_apply_to='focus',
