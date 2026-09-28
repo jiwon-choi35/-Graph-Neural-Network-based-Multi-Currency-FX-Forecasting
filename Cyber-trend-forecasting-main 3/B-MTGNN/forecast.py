@@ -332,6 +332,80 @@ def save_normalized_gap(hist_denorm, forecast_denorm, col, target_names,
     return norm_gap_path
 
 
+def save_forecast_csv(hist_plot, fut_plot, conf_plot, fut_raw, conf_raw,
+                      col, target_indices, dates_future, output_dir=None):
+    """그림에 그려진 2026년 예측값을 CSV로 저장.
+
+    plot_forecast()/plot_multi_node()가 그리는 값과 동일하게:
+      - Forecast_Smoothed : 지수평활 적용 후 값 (개별 플롯의 실선)
+      - CI_Lower/Upper    : Forecast_Smoothed ± 95% CI (음영 구간)
+      - Normalized        : 다국가 비교 플롯과 동일한 base=1.0 지수
+                            (base = 스무딩된 historical 첫 값)
+      - Forecast_Raw      : 스무딩 전 원본 예측값 (predict.csv와 동일)
+
+    두 가지 형태로 저장한다.
+      forecast_2026.csv      : long format (Date × Country 한 행씩)
+      forecast_2026_wide.csv : wide format (국가별 한 행, 월이 컬럼)
+    """
+    if output_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(script_dir)
+        output_dir = os.path.join(project_root, 'AXIS', 'model', 'Bayesian', 'forecast', 'data')
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+    month_labels = [d.strftime('%Y-%m') for d in dates_future]
+
+    long_rows = []
+    wide_rows = []
+
+    for i in target_indices:
+        name = consistent_name(col[i])
+
+        # 플롯과 동일하게 음수 제거
+        f_sm = torch.clamp(fut_plot[:, i], min=0).detach().cpu().numpy()
+        c_sm = conf_plot[:, i].detach().cpu().numpy()
+        f_raw = torch.clamp(fut_raw[:, i], min=0).detach().cpu().numpy()
+        c_raw = conf_raw[:, i].detach().cpu().numpy()
+
+        # 다국가 비교 플롯의 base 값과 동일
+        base = float(hist_plot[0, i].item())
+        if base == 0:
+            base = 1.0
+
+        for t, label in enumerate(month_labels):
+            long_rows.append({
+                'Date': label,
+                'Country': name,
+                'Forecast_Smoothed': f_sm[t],
+                'CI_Lower': f_sm[t] - c_sm[t],
+                'CI_Upper': f_sm[t] + c_sm[t],
+                'CI_95_Width': c_sm[t],
+                'Normalized_Index': f_sm[t] / base,
+                'Forecast_Raw': f_raw[t],
+                'CI_95_Width_Raw': c_raw[t],
+            })
+
+        wide_rows.append([name, 'Forecast_Smoothed'] + f_sm.tolist())
+        wide_rows.append([name, 'CI_Lower'] + (f_sm - c_sm).tolist())
+        wide_rows.append([name, 'CI_Upper'] + (f_sm + c_sm).tolist())
+        wide_rows.append([name, 'Forecast_Raw'] + f_raw.tolist())
+
+    long_path = os.path.join(output_dir, 'forecast_2026.csv')
+    pd.DataFrame(long_rows).to_csv(long_path, index=False, encoding='utf-8-sig')
+
+    wide_path = os.path.join(output_dir, 'forecast_2026_wide.csv')
+    with open(wide_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Country', 'Series'] + month_labels)
+        for row in wide_rows:
+            writer.writerow(row)
+
+    print(f"  -> forecast_2026.csv       (long format: 월별 예측값 + 95% CI)")
+    print(f"  -> forecast_2026_wide.csv  (wide format: 국가별 한 행)")
+    return long_path
+
+
 def plot_forecast(data, forecast, confidence, col_name, dates_hist, dates_future, output_dir=None, color='RoyalBlue'):
     """개별 국가 예측 플롯 생성 (사이버 보안 스타일)"""
     
@@ -776,6 +850,17 @@ if __name__ == "__main__":
     plot_multi_node(hist_plot, fut_plot, conf_plot,
                    target_indices, col, dates_hist, dates_future, plot_dir)
     
+    # --- 2026년 예측값 CSV (그림에 그려진 값과 동일) ---
+    print("\n💾 Saving 2026 forecast values to CSV...")
+    try:
+        save_forecast_csv(hist_plot, fut_plot, conf_plot, Y_denorm, confidence_denorm,
+                          col, target_indices, dates_future, data_out_dir)
+        print("✅ 2026 forecast CSV saved")
+    except Exception as e:
+        print(f"  2026 forecast CSV 생성 중 오류: {e}")
+        import traceback
+        traceback.print_exc()
+
     # --- Node-wise CSV (전체 변수 predict/actual) ---
     print("\n📊 Generating node-wise CSV tables...")
     try:
@@ -826,6 +911,8 @@ if __name__ == "__main__":
     print(f"\n📊 Generated Files:")
     print(f"   • Multi_Country_Forecast_Normalized.png")
     print(f"   • Individual forecast plots for each country")
+    print(f"   • forecast_2026.csv                  (그림과 동일한 월별 예측값 + 95% CI)")
+    print(f"   • forecast_2026_wide.csv             (국가별 한 행 wide 테이블)")
     print(f"   • predict_by_country.csv             (monthly forecasts)")
     print(f"   • country_gap.csv                    (pairwise raw gap)")
     print(f"   • country_gap_pct.csv                (pairwise gap as %)")

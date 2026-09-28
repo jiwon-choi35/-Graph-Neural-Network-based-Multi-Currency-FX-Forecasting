@@ -1,0 +1,10 @@
+﻿row_node,col_node,A_row_to_col_topk,A_col_to_row_topk,asymmetry_topk,A_row_to_col_raw,is_diagonal_self_loop
+us_Trade Weighted Dollar Index,us_Trade Weighted Dollar Index,0.0,0.0,0.0,0.0,True
+us_Trade Weighted Dollar Index,kr_fx,0.0,0.0032,-0.0032,0.0,False
+us_Trade Weighted Dollar Index,jp_fx,0.0,0.0004,-0.0004,0.0,False
+kr_fx,us_Trade Weighted Dollar Index,0.0032,0.0,0.0032,0.0032,False
+kr_fx,kr_fx,0.0,0.0,0.0,0.0,True
+kr_fx,jp_fx,0.0037,0.0,0.0037,0.0037,False
+jp_fx,us_Trade Weighted Dollar Index,0.0004,0.0,0.0004,0.0004,False
+jp_fx,kr_fx,0.0,0.0037,-0.0037,0.0,False
+jp_fx,jp_fx,0.0,0.0,0.0,0.0,True

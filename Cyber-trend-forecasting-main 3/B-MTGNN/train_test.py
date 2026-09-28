@@ -808,6 +808,40 @@ def _evaluate_direct_mode(data, test_window, model, n_input, is_plot,
     return rrse, rae, correlation, smape_val, focus_rrse
 
 
+def export_interval_bounds(data, predict, test, half_width, mc_var, residual_var, split_type):
+    """focus 노드의 월별 예측값, 실제값, 구간 상·하한을 CSV로 저장"""
+    focus_cols = get_focus_columns(data)
+    p = predict.detach().cpu().numpy()
+    a = test.detach().cpu().numpy()
+    hw_eq10 = half_width.detach().cpu().numpy()                     # 식 (10): 0.6*2.58*sqrt(...)
+    hw_95 = (1.96 * torch.sqrt(mc_var + residual_var.expand_as(mc_var))).detach().cpu().numpy()
+
+    rows = []
+    for c in focus_cols:
+        for t in range(p.shape[0]):
+            rows.append({
+                'node': data.col[c], 'step': t + 1,
+                'actual': a[t, c], 'predict': p[t, c],
+                'lower_eq10': p[t, c] - hw_eq10[t, c], 'upper_eq10': p[t, c] + hw_eq10[t, c],
+                'lower_95': p[t, c] - hw_95[t, c], 'upper_95': p[t, c] + hw_95[t, c],
+            })
+    df = pd.DataFrame(rows)
+    df['in_eq10'] = (df['actual'] >= df['lower_eq10']) & (df['actual'] <= df['upper_eq10'])
+    df['in_95'] = (df['actual'] >= df['lower_95']) & (df['actual'] <= df['upper_95'])
+
+    save_dir = MODEL_BASE_DIR / split_type
+    save_dir.mkdir(parents=True, exist_ok=True)
+    df.to_csv(save_dir / f'interval_bounds_{split_type}.csv', index=False, encoding='utf-8-sig')
+
+    summary = df.groupby('node').agg(
+        lower_eq10_mean=('lower_eq10', 'mean'), upper_eq10_mean=('upper_eq10', 'mean'),
+        lower_95_mean=('lower_95', 'mean'), upper_95_mean=('upper_95', 'mean'),
+        coverage_eq10=('in_eq10', 'mean'), coverage_95=('in_95', 'mean'),
+    )
+    summary.to_csv(save_dir / f'interval_summary_{split_type}.csv', encoding='utf-8-sig')
+    print(f'[interval] {split_type} bounds saved ->', save_dir)
+    print(summary.round(4))
+
 def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_input, is_plot, split_type='Testing', bias_offset=None, return_arrays=False):
     # --- Direct mode dispatch ---
     if args.rollout_mode == 'direct' and args.seq_out_len > 1:
@@ -930,6 +964,10 @@ def evaluate_sliding_window(data, test_window, model, evaluateL2, evaluateL1, n_
     
     mc_var = (confidence_95 / 2.58) ** 2
     confidence_95 = 2.58 * torch.sqrt(mc_var + residual_var.expand_as(mc_var)) * 0.6
+
+    if is_plot:
+        export_interval_bounds(data, predict, test, confidence_95, mc_var, residual_var, split_type)
+    
     # Restore mean for z-score normalization (normalize=3)
     if hasattr(data, 'mean'):
         mean_expand = data.mean.expand(test.size(0), data.m)
