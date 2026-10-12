@@ -3,8 +3,9 @@
 Forecast for month t is made at the end of month t-1. A macro value for reference month k is usable
 only if it had been released by then:
   monthly indicators : released `lag` months after the reference month (table MONTHLY_LAG)
-  quarterly GDP      : the value repeated over a quarter's three months is released `d` months after
-                       the quarter end (GDP_RELEASE), so all three rows become known at once
+  quarterly series   : data.csv repeats one value over a quarter's three months (3-country GDP and
+                       KR/JP employment, unemployment, trade balance). That value is released `d` months
+                       after the quarter end (QUARTERLY_RELEASE), so all three rows become known at once
   FX-derived nodes, policy rates: no lag
 
 Two ways of feeding the delayed information (both from data.csv, then the same double exponential
@@ -28,21 +29,27 @@ from rev_common import (RAW_PATH, SEQ_IN, TARGET_LABEL, double_exp_smooth, load_
 
 MONTHLY_LAG = {
     'US_CPI': 1, 'KR_CPI': 1, 'JP_CPI': 1,
-    'US_Employment': 1, 'KR_Employment': 1, 'JP_Employment': 1,
-    'US_Unemployment': 1, 'KR_Unemployment': 1, 'JP_Unemployment': 1,
-    'US_Trade_Balance': 2, 'KR_Trade_Balance': 1, 'JP_Trade_Balance': 1,
+    'US_Employment': 1, 'US_Unemployment': 1,
+    'US_Trade_Balance': 2,
     'US_Interest_Rate': 0, 'KR_Interest_Rate': 0, 'JP_Interest_Rate': 0,
 }
-GDP_RELEASE = {'US_GDP': 1, 'KR_GDP': 1, 'JP_GDP': 2}   # months after quarter end (advance / 1st prelim.)
+# months after quarter end until the quarter's value is out (GDP: advance / 1st prelim.; KR/JP labour and
+# trade: last month of the quarter is published one month later)
+QUARTERLY_RELEASE = {
+    'US_GDP': 1, 'KR_GDP': 1, 'JP_GDP': 2,
+    'KR_Employment': 1, 'JP_Employment': 1,
+    'KR_Unemployment': 1, 'JP_Unemployment': 1,
+    'KR_Trade_Balance': 1, 'JP_Trade_Balance': 1,
+}
 TEST_ROWS = list(range(168, 180))                        # 2025-01 .. 2025-12
 
 
 def known_mask(col, n_rows, s):
     """Boolean [n_rows]: is the value for reference row k published by the end of row s?"""
     k = np.arange(n_rows)
-    if col in GDP_RELEASE:
+    if col in QUARTERLY_RELEASE:
         q_end = k - (k % 3) + 2                          # rows start at January, so quarters align
-        return (q_end + GDP_RELEASE[col] <= s) & (k <= s)
+        return (q_end + QUARTERLY_RELEASE[col] <= s) & (k <= s)
     return k <= s - MONTHLY_LAG[col]
 
 
@@ -81,8 +88,14 @@ def main():
     dates, cols, SM = load_frame()
     _, rcols, RAW = load_frame(RAW_PATH)
     assert rcols == cols
-    macro = [c for c in cols if c in MONTHLY_LAG or c in GDP_RELEASE]
+    macro = [c for c in cols if c in MONTHLY_LAG or c in QUARTERLY_RELEASE]
     mj = [cols.index(c) for c in macro]
+    # The release rule must match how data.csv stores each series: quarterly rules only for series that
+    # repeat one value within every quarter (checked from 2015 on), monthly rules for the rest.
+    for c in macro:
+        q = RAW[48:180, cols.index(c)].reshape(-1, 3)
+        quarter_constant = bool(np.all((q[:, 0] == q[:, 1]) & (q[:, 1] == q[:, 2])))
+        assert quarter_constant == (c in QUARTERLY_RELEASE), f'{c}: release rule does not match data.csv'
     tix = target_idx(cols)
     scale = train_scale(SM, 156)
 
