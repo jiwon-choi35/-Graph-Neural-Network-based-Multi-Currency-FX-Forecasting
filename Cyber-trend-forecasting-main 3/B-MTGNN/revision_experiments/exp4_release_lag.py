@@ -80,7 +80,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--models', nargs='+', required=True, help='name=path pairs')
     p.add_argument('--seed', type=int, default=1)
-    p.add_argument('--out', default=str(Path(__file__).resolve().parent / 'results' / 'exp4'))
+    p.add_argument('--out', default=str(Path(__file__).resolve().parent / 'results' / 'release_lag'))
     args = p.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

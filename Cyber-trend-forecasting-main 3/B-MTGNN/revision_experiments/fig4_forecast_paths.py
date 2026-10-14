@@ -30,7 +30,7 @@ SERIES = [  # (sm_data column, exp12 target label, legend label, colour, line wi
 BASE_ROW = {'2011-01': 0, '2025-12': -1}
 
 p = argparse.ArgumentParser()
-p.add_argument('--forecast', default=str(HERE / 'reference_results' / 'exp12' / 'exp2_forecast2026_monthly.csv'))
+p.add_argument('--forecast', default=str(HERE / 'reference_results' / 'recursive_backtest_2026_forecast' / 'exp2_forecast2026_monthly.csv'))
 p.add_argument('--variant', default='eq7')
 p.add_argument('--band', default='hw_mc_resh_95')
 p.add_argument('--base', default='2011-01', choices=sorted(BASE_ROW), help='month whose smoothed value is set to 1')

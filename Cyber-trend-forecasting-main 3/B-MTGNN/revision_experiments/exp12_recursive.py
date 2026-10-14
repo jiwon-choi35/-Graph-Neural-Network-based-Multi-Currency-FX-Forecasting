@@ -26,7 +26,7 @@ p.add_argument('--paper_runs', type=int, default=20, help='MC trajectories used 
 p.add_argument('--n_seeds', type=int, default=10, help='seeds for the MC-sensitivity check')
 p.add_argument('--roll_runs', type=int, default=50)
 p.add_argument('--seed', type=int, default=1)
-p.add_argument('--out', default=str(Path(__file__).resolve().parent / 'results' / 'exp12'))
+p.add_argument('--out', default=str(Path(__file__).resolve().parent / 'results' / 'recursive_backtest_2026_forecast'))
 args = p.parse_args()
 
 out = Path(args.out)
