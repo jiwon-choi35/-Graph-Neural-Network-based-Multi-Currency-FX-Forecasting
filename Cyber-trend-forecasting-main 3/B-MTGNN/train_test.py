@@ -1456,6 +1456,7 @@ parser.add_argument('--device', type=str, default='cuda:1', help='')
 parser.add_argument('--gcn_true', type=bool, default=False, help='whether to add graph convolution layer')
 parser.add_argument('--buildA_true', type=bool, default=False, help='whether to construct adaptive adjacency matrix')
 parser.add_argument('--use_graph', type=int, default=1, choices=[0, 1], help='1: use graph modules, 0: disable graph modules')
+parser.add_argument('--adj_mode', type=str, default='learned', choices=['learned', 'identity'], help='learned: adaptive adjacency; identity: fixed A=I (graph propagation off, same parameters) for ablation')
 parser.add_argument('--gcn_depth', type=int, default=1, help='graph convolution depth')
 parser.add_argument('--num_nodes', type=int, default=142, help='number of nodes/variables')
 parser.add_argument('--dropout', type=float, default=0.1, help='dropout rate')
@@ -2026,8 +2027,10 @@ def main(experiment):
         # ============================================================
 
         use_graph = bool(args.use_graph)
-        model = gtnet(use_graph, use_graph, gcn_depth, args.num_nodes,
-                      device, Data.adj, dropout=dropout, subgraph_size=k,
+        build_adj = use_graph and args.adj_mode == 'learned'
+        predefined_adj = torch.eye(args.num_nodes, device=device) if args.adj_mode == 'identity' else Data.adj
+        model = gtnet(use_graph, build_adj, gcn_depth, args.num_nodes,
+                      device, predefined_adj, dropout=dropout, subgraph_size=k,
                       node_dim=node_dim, dilation_exponential=dilation_ex,
                       conv_channels=conv, residual_channels=res,
                       skip_channels=skip, end_channels=end,
