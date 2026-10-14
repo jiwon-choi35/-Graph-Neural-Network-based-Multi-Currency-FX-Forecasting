@@ -1,0 +1,20 @@
+{
+  "USD Index": {
+    "ratio_DecJan_eq10": 1.0011351108551025,
+    "ratio_Q4Q1_eq10": 0.9757592082023621,
+    "mean_hw_eq10": 0.5448536276817322,
+    "coverage_eq10": 11
+  },
+  "JPY/USD": {
+    "ratio_DecJan_eq10": 1.0012446641921997,
+    "ratio_Q4Q1_eq10": 1.0080448389053345,
+    "mean_hw_eq10": 1.203452706336975,
+    "coverage_eq10": 11
+  },
+  "KRW/USD": {
+    "ratio_DecJan_eq10": 1.0006952285766602,
+    "ratio_Q4Q1_eq10": 0.9863840937614441,
+    "mean_hw_eq10": 10.141414642333984,
+    "coverage_eq10": 10
+  }
+}
