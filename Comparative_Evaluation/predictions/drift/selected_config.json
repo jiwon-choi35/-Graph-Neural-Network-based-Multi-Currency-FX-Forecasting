@@ -1,0 +1,31 @@
+{
+  "model": "Drift",
+  "source_path": "runs/reviewer_matched_20260923/baseline_robustness/drift/config.json",
+  "recorded_configuration": {
+    "model": "drift",
+    "data_path": "external_team_repo_20260922_newzip/Cyber-trend-forecasting-main 3/B-MTGNN/data/sm_data.csv",
+    "data_sha256": "5086946995c5e2da176c17a73b94ebdbdb6c2e75f2a59b5cc5c1d932031132dd",
+    "split": {
+      "train": "2011-01..2023-12",
+      "validation": "2024-01..2024-12",
+      "test": "2025-01..2025-12"
+    },
+    "targets": {
+      "US": "us_Trade Weighted Dollar Index",
+      "KR": "kr_fx",
+      "JP": "jp_fx"
+    },
+    "selection": {
+      "fixed": true
+    },
+    "max_valid_rrse": 0.7626417282957703,
+    "max_test_rrse": 0.6517025064308376,
+    "test_evaluations": 1,
+    "test_parsed_after_selection": true,
+    "recursive": false,
+    "input_scope": "target-only",
+    "neural_seed_policy": null
+  },
+  "data_sha256": "5086946995c5e2da176c17a73b94ebdbdb6c2e75f2a59b5cc5c1d932031132dd",
+  "snapshot_note": "Existing metadata only; original source is unchanged."
+}

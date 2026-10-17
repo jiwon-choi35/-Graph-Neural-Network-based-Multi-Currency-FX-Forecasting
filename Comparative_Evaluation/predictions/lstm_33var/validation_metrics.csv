@@ -1,0 +1,4 @@
+arm,model,input_scope,target,target_label,valid_rrse,valid_rmse,max_valid_rrse,mean_valid_rrse,selection_type,member_seeds,member_epochs,anchor_alpha,config_id,window,hidden,layers,dropout,learning_rate,loss,batch_size
+lstm_33_variable_residual_delta,LSTM,33-variable,us_Trade Weighted Dollar Index,US,0.36220681832260077,0.2691700820155495,0.42435783769350455,0.39628475992877554,top2_seed_mean,5;2,10;9,1.0,6,6,24,1,0.1,0.0005,huber,8
+lstm_33_variable_residual_delta,LSTM,33-variable,kr_fx,KR,0.42435783769350455,4.201607071000072,0.42435783769350455,0.39628475992877554,top2_seed_mean,5;2,10;9,1.0,6,6,24,1,0.1,0.0005,huber,8
+lstm_33_variable_residual_delta,LSTM,33-variable,jp_fx,JP,0.40228962377022126,0.6703880115162938,0.42435783769350455,0.39628475992877554,top2_seed_mean,5;2,10;9,1.0,6,6,24,1,0.1,0.0005,huber,8

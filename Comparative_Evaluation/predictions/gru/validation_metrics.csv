@@ -1,0 +1,4 @@
+arm,label,target,target_label,valid_rrse,valid_rae,valid_rmse,max_valid_rrse,mean_valid_rrse
+gru_33_variable_residual_delta,2026-10 new run (not a result of the 2026-09-30 preregistered run),us_Trade Weighted Dollar Index,US,0.31389335719643346,0.3009006393821301,0.2332664555901546,0.36087018767250334,0.33646171161999244
+gru_33_variable_residual_delta,2026-10 new run (not a result of the 2026-09-30 preregistered run),kr_fx,KR,0.3346215899910407,0.3526787457833139,3.3131199985779443,0.36087018767250334,0.33646171161999244
+gru_33_variable_residual_delta,2026-10 new run (not a result of the 2026-09-30 preregistered run),jp_fx,JP,0.36087018767250334,0.32823983197992035,0.6013653677218934,0.36087018767250334,0.33646171161999244

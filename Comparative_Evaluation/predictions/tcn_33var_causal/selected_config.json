@@ -1,0 +1,25 @@
+{
+  "model": "TCN-33var causal residual_delta",
+  "source_path": "runs/reviewer_matched_20261001/tcn_stability_check/tcn_selected_config.csv",
+  "recorded_configuration": {
+    "model": "TCN-33var residual_delta causal",
+    "input_scope": "33-variable",
+    "prediction_mode": "residual_delta",
+    "config_id": "2",
+    "window": "3",
+    "kernel_size": "3",
+    "num_channels": "16",
+    "dropout": "0.1",
+    "learning_rate": "0.0005",
+    "loss": "huber",
+    "batch_size": "8",
+    "seed": "5",
+    "selected_epoch": "36",
+    "anchor_alpha": "1.0",
+    "max_valid_rrse": "0.35264249603481135",
+    "mean_valid_rrse": "0.3464453045891997",
+    "padding": "causal_left_only"
+  },
+  "data_sha256": "5086946995c5e2da176c17a73b94ebdbdb6c2e75f2a59b5cc5c1d932031132dd",
+  "snapshot_note": "Existing metadata only; original source is unchanged."
+}

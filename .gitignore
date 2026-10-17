@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.venv/
+
+# local files moved out of the repository during cleanup
+delete/
+
+# caches created by train_test.py
+B-MTGNN/data/*.pt
+B-MTGNN/tuning_runs/
+CLAUDE.md

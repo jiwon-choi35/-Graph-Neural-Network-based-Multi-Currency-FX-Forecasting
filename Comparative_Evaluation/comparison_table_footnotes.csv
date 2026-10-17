@@ -1,0 +1,22 @@
+model,split,target,RRSE,RAE,source,RRSE_sd,RAE_sd
+Linear extrapolation 2y[t-1]-y[t-2] (no estimation),val,US,0.2770073470091391,0.25074287221861685,"posthoc (rule, no selection)",,
+Linear extrapolation 2y[t-1]-y[t-2] (no estimation),val,KR,0.3503157902323936,0.39972710498126085,"posthoc (rule, no selection)",,
+Linear extrapolation 2y[t-1]-y[t-2] (no estimation),val,JP,0.33968717030027196,0.2687906954963285,"posthoc (rule, no selection)",,
+Linear extrapolation 2y[t-1]-y[t-2] (no estimation),test,US,0.2042995253377506,0.19793407663035284,"posthoc (rule, no selection)",,
+Linear extrapolation 2y[t-1]-y[t-2] (no estimation),test,KR,0.1344295751092962,0.1295883241795925,"posthoc (rule, no selection)",,
+Linear extrapolation 2y[t-1]-y[t-2] (no estimation),test,JP,0.15857784463910507,0.15033359757926523,"posthoc (rule, no selection)",,
+Transformer without persistence blend (alpha=1),test,US,1.0228516055495636,1.0311011813338562,"posthoc on original_saved (baseline_audit.py, 1015)",,
+Transformer without persistence blend (alpha=1),test,KR,0.5164688383324015,0.5821041945512082,"posthoc on original_saved (baseline_audit.py, 1015)",,
+Transformer without persistence blend (alpha=1),test,JP,0.3873420867182303,0.3991309957116401,"posthoc on original_saved (baseline_audit.py, 1015)",,
+B-MTGNN retrain seeds 1-5 (w/o Eq.7),test,JP,0.2834888389271819,0.2579698331639233,new computation on ablation full_s1..s5 checkpoints,0.0380262075158327,0.0330463225705381
+B-MTGNN retrain seeds 1-5 (w/o Eq.7),test,KR,0.3669548808733371,0.3878095056489464,new computation on ablation full_s1..s5 checkpoints,0.1463128902495224,0.159308006825167
+B-MTGNN retrain seeds 1-5 (w/o Eq.7),test,US,0.4655046125907957,0.4219482971038643,new computation on ablation full_s1..s5 checkpoints,0.2239844264642294,0.2020939630301605
+B-MTGNN retrain seeds 1-5 (w/o Eq.7),val,JP,0.6469424396788159,0.5031984378712284,new computation on ablation full_s1..s5 checkpoints,0.1138570951045937,0.0852280804086868
+B-MTGNN retrain seeds 1-5 (w/o Eq.7),val,KR,0.5910506107560142,0.6468681763863133,new computation on ablation full_s1..s5 checkpoints,0.0756460665079366,0.1093583322971495
+B-MTGNN retrain seeds 1-5 (w/o Eq.7),val,US,0.5109712060447191,0.508467700404988,new computation on ablation full_s1..s5 checkpoints,0.0627453786482281,0.0793493210090156
+"B-MTGNN retrain seeds 1-5 (val_alpha, per-seed val alpha)",test,JP,0.284473061752038,0.2781579678223183,new computation on ablation full_s1..s5 checkpoints,0.0141048034072619,0.012035453720635
+"B-MTGNN retrain seeds 1-5 (val_alpha, per-seed val alpha)",test,KR,0.1983142639598316,0.2212839859063056,new computation on ablation full_s1..s5 checkpoints,0.0752325749427061,0.0867210337440099
+"B-MTGNN retrain seeds 1-5 (val_alpha, per-seed val alpha)",test,US,0.3179354181185279,0.2895928401476235,new computation on ablation full_s1..s5 checkpoints,0.110393180995652,0.1144446575045637
+"B-MTGNN retrain seeds 1-5 (val_alpha, per-seed val alpha)",val,JP,0.3830113947034651,0.3478680085984448,new computation on ablation full_s1..s5 checkpoints,0.0291162164726569,0.028722632752527
+"B-MTGNN retrain seeds 1-5 (val_alpha, per-seed val alpha)",val,KR,0.454398163712652,0.4693621486574947,new computation on ablation full_s1..s5 checkpoints,0.0430367466428299,0.0398355651861721
+"B-MTGNN retrain seeds 1-5 (val_alpha, per-seed val alpha)",val,US,0.4272645275638451,0.3917998354598023,new computation on ablation full_s1..s5 checkpoints,0.0994746116214051,0.0782333547287814
