@@ -8,13 +8,13 @@ Saved results for comparing B-MTGNN with the baseline models on the 2025 test ye
 - Monthly one-step prediction with actual updates: the prediction for month t uses actual values up to t-1
 - Targets: US Trade Weighted Dollar Index (US), USD/KRW (KR), USD/JPY (JP), evaluated on the smoothed series in `B-MTGNN/data/sm_data.csv`
 - Model and setting selection uses the 2024 validation set only
-- Metrics: RRSE and RAE on the level series
+- Metrics: RRSE and RAE on the level series; the CSV also has 2025 MAE, RMSE, MAPE (%) and sMAPE (%), computed from `predictions/` by `add_point_metrics.py`
 
 ## Files
 
 | File | Contents |
 |---|---|
-| `comparison_table_2025.csv` / `.md` | 2024 validation RRSE and 2025 test RRSE/RAE for every model, with the source of each value |
+| `comparison_table_2025.csv` / `.md` | 2024 validation RRSE and 2025 test RRSE/RAE for every model, with the source of each value (the CSV also has 2025 MAE/RMSE/MAPE/sMAPE) |
 | `comparison_table_footnotes.csv` | Supplementary rows (linear extrapolation, Transformer without blending, B-MTGNN retrained with seeds 1-5) |
 | `direction_metrics/summary_2025.csv` | Direction accuracy (%), F1 and change correlation per currency |
 | `direction_metrics/direction_metrics_2025.csv`, `f1_2025.csv` | Full values: hit counts, up/down F1, macro-F1, number of predicted down months |
