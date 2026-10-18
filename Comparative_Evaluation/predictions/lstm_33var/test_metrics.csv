@@ -1,0 +1,4 @@
+arm,model,input_scope,target,target_label,test_rrse,test_rmse,max_test_rrse,mean_test_rrse,selection_type,member_seeds,anchor_alpha,n_months,pred_csv
+lstm_33_variable_residual_delta,LSTM,33-variable,us_Trade Weighted Dollar Index,US,0.667390767950335,0.709777639274631,0.667390767950335,0.4478769022025926,top2_seed_mean,5;2,1.0,12,runs/reviewer_matched_20260930/neural_residual_stability/predictions/lstm_33_variable_residual_delta_US.csv
+lstm_33_variable_residual_delta,LSTM,33-variable,kr_fx,KR,0.2813527845715702,7.024363439560184,0.667390767950335,0.4478769022025926,top2_seed_mean,5;2,1.0,12,runs/reviewer_matched_20260930/neural_residual_stability/predictions/lstm_33_variable_residual_delta_KR.csv
+lstm_33_variable_residual_delta,LSTM,33-variable,jp_fx,JP,0.3948871540858725,1.0500698753894415,0.667390767950335,0.4478769022025926,top2_seed_mean,5;2,1.0,12,runs/reviewer_matched_20260930/neural_residual_stability/predictions/lstm_33_variable_residual_delta_JP.csv

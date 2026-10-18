@@ -1,0 +1,25 @@
+{
+  "model": "Transformer-33var residual_delta",
+  "source_path": "runs/reviewer_matched_20260930/neural_residual_stability/selected_configs.csv",
+  "recorded_configuration": {
+    "arm": "transformer_33_variable_residual_delta",
+    "model": "TRANSFORMER",
+    "input_scope": "33-variable",
+    "selection_type": "single_seed",
+    "member_seeds": "5",
+    "member_epochs": "42",
+    "anchor_alpha": "0.5",
+    "max_valid_rrse": "0.34104210210522024",
+    "mean_valid_rrse": "0.33758868472175196",
+    "config_id": "4",
+    "window": "6",
+    "hidden": "8",
+    "layers": "1",
+    "dropout": "0.0",
+    "learning_rate": "0.001",
+    "loss": "huber",
+    "batch_size": "8"
+  },
+  "data_sha256": "5086946995c5e2da176c17a73b94ebdbdb6c2e75f2a59b5cc5c1d932031132dd",
+  "snapshot_note": "Existing metadata only; original source is unchanged."
+}

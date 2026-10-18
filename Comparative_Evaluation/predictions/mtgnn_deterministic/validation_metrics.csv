@@ -1,0 +1,4 @@
+arm,target,eval_mode,best_epoch,valid_rrse,valid_rmse,average_valid_rrse,n_months,pred_csv
+mtgnn_deterministic,us_Trade Weighted Dollar Index,one_step_update,28,0.2242986636229138,0.16668503578360014,0.38909331543198356,12,runs/reviewer_matched_20260919/full_valid_select/mtgnn_deterministic/predictions_valid_US.csv
+mtgnn_deterministic,kr_fx,one_step_update,28,0.3983280346097411,3.943884865548788,0.38909331543198356,12,runs/reviewer_matched_20260919/full_valid_select/mtgnn_deterministic/predictions_valid_KR.csv
+mtgnn_deterministic,jp_fx,one_step_update,28,0.5446532480632957,0.9076258066417269,0.38909331543198356,12,runs/reviewer_matched_20260919/full_valid_select/mtgnn_deterministic/predictions_valid_JP.csv

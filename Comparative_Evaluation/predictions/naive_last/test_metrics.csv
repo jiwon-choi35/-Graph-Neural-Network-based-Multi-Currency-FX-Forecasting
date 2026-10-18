@@ -1,0 +1,4 @@
+model,target,target_label,test_rrse,test_rmse,n_months,eval_mode,max_test_rrse
+naive_last,us_Trade Weighted Dollar Index,US,0.6423380006462776,0.6831337375482381,12,one_step_update,0.6423380006462776
+naive_last,kr_fx,KR,0.4463339123033847,11.143346671311246,12,one_step_update,0.6423380006462776
+naive_last,jp_fx,JP,0.31012008281238024,0.824660294327386,12,one_step_update,0.6423380006462776

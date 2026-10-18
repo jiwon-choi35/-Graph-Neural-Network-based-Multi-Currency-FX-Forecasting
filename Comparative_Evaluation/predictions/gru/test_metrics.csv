@@ -1,0 +1,4 @@
+arm,label,target,target_label,test_rrse,test_rae,test_rmse,max_test_rrse,mean_test_rrse,selection_type,member_seeds,anchor_alpha,n_months,test_evaluations
+gru_33_variable_residual_delta,2026-10 new run (not a result of the 2026-09-30 preregistered run),us_Trade Weighted Dollar Index,US,0.8466211779727093,0.8493562730888919,0.9003912099456773,0.8466211779727093,0.5848047161396276,top2_seed_mean,3;5,1.0,12,1
+gru_33_variable_residual_delta,2026-10 new run (not a result of the 2026-09-30 preregistered run),kr_fx,KR,0.3426529011569494,0.35085101057997736,8.554806077399371,0.8466211779727093,0.5848047161396276,top2_seed_mean,3;5,1.0,12,1
+gru_33_variable_residual_delta,2026-10 new run (not a result of the 2026-09-30 preregistered run),jp_fx,JP,0.5651400692892238,0.5636471259776669,1.5028003721971324,0.8466211779727093,0.5848047161396276,top2_seed_mean,3;5,1.0,12,1

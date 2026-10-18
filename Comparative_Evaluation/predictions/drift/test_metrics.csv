@@ -1,0 +1,4 @@
+model,target,target_label,test_rrse,test_rmse,n_months,eval_mode,max_test_rrse
+drift,us_Trade Weighted Dollar Index,US,0.6517025064308376,0.6930929954941517,12,one_step_update,0.6517025064308376
+drift,kr_fx,KR,0.3976779612288916,9.928583204992123,12,one_step_update,0.6517025064308376
+drift,jp_fx,JP,0.41107157056335114,1.0931069000632325,12,one_step_update,0.6517025064308376

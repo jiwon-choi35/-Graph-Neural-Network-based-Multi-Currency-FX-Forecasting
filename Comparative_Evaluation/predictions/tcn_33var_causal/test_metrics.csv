@@ -1,0 +1,4 @@
+model,target,target_label,test_rrse,test_rmse,max_test_rrse,mean_test_rrse,n_months,test_evaluations
+TCN-33var residual_delta causal,us_Trade Weighted Dollar Index,US,0.7067994565915918,0.7516892259101564,0.7067994565915918,0.5436685419712778,12,1
+TCN-33var residual_delta causal,kr_fx,KR,0.6002136923125375,14.985169322648458,0.7067994565915918,0.5436685419712778,12,1
+TCN-33var residual_delta causal,jp_fx,JP,0.32399247700970396,0.8615492715843396,0.7067994565915918,0.5436685419712778,12,1

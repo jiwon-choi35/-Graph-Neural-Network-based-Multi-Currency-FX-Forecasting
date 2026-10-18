@@ -1,0 +1,25 @@
+{
+  "model": "LSTM-33var residual_delta",
+  "source_path": "runs/reviewer_matched_20260930/neural_residual_stability/selected_configs.csv",
+  "recorded_configuration": {
+    "arm": "lstm_33_variable_residual_delta",
+    "model": "LSTM",
+    "input_scope": "33-variable",
+    "selection_type": "top2_seed_mean",
+    "member_seeds": "5;2",
+    "member_epochs": "10;9",
+    "anchor_alpha": "1.0",
+    "max_valid_rrse": "0.42435783769350455",
+    "mean_valid_rrse": "0.39628475992877554",
+    "config_id": "6",
+    "window": "6",
+    "hidden": "24",
+    "layers": "1",
+    "dropout": "0.1",
+    "learning_rate": "0.0005",
+    "loss": "huber",
+    "batch_size": "8"
+  },
+  "data_sha256": "5086946995c5e2da176c17a73b94ebdbdb6c2e75f2a59b5cc5c1d932031132dd",
+  "snapshot_note": "Existing metadata only; original source is unchanged."
+}
